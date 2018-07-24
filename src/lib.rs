@@ -34,7 +34,8 @@ use differential_dataflow::operators::Consolidate;
 // TYPES
 //
 
-pub type Entity = u64;
+// pub type Entity = u64;
+pub type Entity = (usize, usize);
 pub type Attribute = u32;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
@@ -264,6 +265,8 @@ fn implement<A: timely::Allocate, T: Timestamp+Lattice> (
     for rule in rules.iter() {
         source_map.entry(rule.name.clone()).or_insert_with(|| scope.new_collection());
     }
+
+    source_map.insert("-id".to_string(), scope.new_collection());
     
     scope.scoped(|nested| {
 
@@ -296,6 +299,15 @@ fn implement<A: timely::Allocate, T: Timestamp+Lattice> (
         relation_map.insert(name.clone(), output_relation);
         
         result_map.insert(name.clone(), RelationHandles { input: source_handle, trace: output_trace });
+
+        relation_map.get_mut("-id").unwrap().add_execution(
+            &impl_ctx.e_av.enter(nested).as_collection(|ref k, ref v| {
+                match k[0] {
+                    Value::Eid(eid) => vec![Value::Eid(eid.clone()), Value::Number(eid.0 as i64), Value::Number(eid.1 as i64)],
+                    _ => panic!("AAARGH")
+                }
+            })
+        );
         
         for rule in rules.iter() {
             println!("Planning {:?}", rule.name);
