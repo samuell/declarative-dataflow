@@ -221,7 +221,7 @@ fn selection_set_to_paths (selection_set: &SelectionSet, parent_path: &Vec<Strin
             pull_attributes,
             path_attributes: parent_path.to_vec(),
             variables,
-            plan: Box::new(Plan::MatchA(0, parent_path[0].to_string(), 1))
+            plan: Box::new(Plan::MatchA(0, parent_path.last().unwrap().to_string(), 1))
         };
         result.push(pull_level);
     }
