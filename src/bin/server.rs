@@ -484,6 +484,12 @@ fn main() {
                                 }
                                 Request::AdvanceInput(name, tx) => server.advance_input(name, tx),
                                 Request::CloseInput(name) => server.close_input(name),
+                                #[cfg(feature="graphql")]
+                                Request::GraphQl(name, query) => {
+                                    worker.dataflow::<u64, _, _>(|scope| {
+                                        server.register_graph_ql(query, &name, scope);
+                                    });
+                                }
                             }
                         }
                     }

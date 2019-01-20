@@ -15,6 +15,8 @@ extern crate abomonation;
 #[macro_use]
 extern crate serde_derive;
 extern crate num_rational;
+#[cfg(feature="graphql")]
+extern crate graphql_parser;
 
 pub mod binding;
 pub mod plan;

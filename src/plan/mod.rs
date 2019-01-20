@@ -71,6 +71,9 @@ pub trait ImplContext {
     fn is_underconstrained(&self, name: &str) -> bool;
 }
 
+#[cfg(feature="graphql")]
+pub use self::pull::GraphQl;
+
 /// A type that can be implemented as a simple relation.
 pub trait Implementable {
     /// Returns names of any other implementable things that need to
@@ -131,6 +134,9 @@ pub enum Plan {
     Pull(Pull<Plan>),
     /// Single-level pull expression
     PullLevel(PullLevel<Plan>),
+    /// GraphQl pull expression
+    #[cfg(feature="graphql")]
+    GraphQl(GraphQl),
 }
 
 impl Plan {
@@ -376,6 +382,8 @@ impl Implementable for Plan {
             }
             &Plan::Pull(ref pull) => pull.implement(nested, local_arrangements, context),
             &Plan::PullLevel(ref path) => path.implement(nested, local_arrangements, context),
+            #[cfg(feature="graphql")]
+            &Plan::GraphQl(ref query) => query.implement(nested, local_arrangements, global_arrangements),
         }
     }
 }
