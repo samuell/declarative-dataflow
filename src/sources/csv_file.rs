@@ -34,7 +34,7 @@ impl Sourceable for CsvFile {
 
         generic::operator::source(scope, &format!("File({})", filename), |capability, info| {
             let activator = scope.activator_for(&info.address[..]);
-
+            
             let mut cap = Some(capability);
 
             let worker_index = scope.index();
@@ -51,11 +51,11 @@ impl Sourceable for CsvFile {
             // @TODO this is annoying
             let separator = self.separator.clone();
             let schema = self.schema.clone();
-
+            
             move |output| {
                 if iterator.peek().is_some() {
                     let mut session = output.session(cap.as_ref().unwrap());
-
+                    
                     for readline in iterator.by_ref().take(255) {
                         let line: String = readline.ok().expect("read error");
 
@@ -96,7 +96,7 @@ impl Sourceable for CsvFile {
 
                                 session.give((name_idx, ((eid.clone(), v), 0, 1)));
                             }
-
+                            
                             num_datums_read += 1;
                         }
 

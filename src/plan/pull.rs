@@ -154,7 +154,7 @@ impl<P: Implementable> Implementable for PullLevel<P> {
                         let mut result = interleave(path, &path_attributes);
                         result.push(attribute.clone());
                         result.push(v.clone());
-
+                        
                         Some(result)
                     })
                     .inner
@@ -194,7 +194,7 @@ impl<P: Implementable> Implementable for Pull<P> {
             symbols: vec![], // @TODO
             tuples,
         }
-    }
+    }   
 }
 
 #[cfg(feature="graphql")]
@@ -237,7 +237,7 @@ fn selection_set_to_paths (selection_set: &SelectionSet, parent_path: &Vec<Strin
 ///     Operation(SelectionSet(SelectionSet {
 ///       items: [
 ///         Field(Field {
-///           name: ...,
+///           name: ..., 
 ///           selection_set: SelectionSet(...}
 ///         }),
 ///         ...
