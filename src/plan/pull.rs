@@ -237,7 +237,7 @@ fn selection_set_to_paths (selection_set: &SelectionSet, parent_path: &Vec<Strin
 ///     Operation(SelectionSet(SelectionSet {
 ///       items: [
 ///         Field(Field {
-///           name: ..., 
+///           name: ...,
 ///           selection_set: SelectionSet(...}
 ///         }),
 ///         ...
