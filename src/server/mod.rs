@@ -3,28 +3,28 @@
 extern crate differential_dataflow;
 extern crate timely;
 
+#[cfg(feature = "graphql")]
+use std::cmp::{Ordering, PartialEq, PartialOrd};
+#[cfg(feature = "graphql")]
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-#[cfg(feature="graphql")]
-use std::collections::BTreeMap;
-#[cfg(feature="graphql")]
-use std::cmp::{Ordering, PartialOrd, PartialEq};
 
 use timely::dataflow::operators::{Filter, Map};
 use timely::dataflow::{ProbeHandle, Scope};
 
 use differential_dataflow::collection::Collection;
 use differential_dataflow::input::{Input, InputSession};
+#[cfg(feature = "graphql")]
+use differential_dataflow::operators::Group;
 use differential_dataflow::trace::TraceReader;
 use differential_dataflow::AsCollection;
-#[cfg(feature="graphql")]
-use differential_dataflow::operators::Group;
 
+#[cfg(feature = "graphql")]
+use crate::plan::{GraphQl, Plan};
 use crate::plan::{ImplContext, Implementable};
-#[cfg(feature="graphql")]
-use crate::plan::{Plan, GraphQl};
 use crate::sources::{Source, Sourceable};
-use crate::{implement, implement_neu, Rule, CollectionIndex, RelationHandle, TraceKeyHandle};
+use crate::{implement, implement_neu, CollectionIndex, RelationHandle, Rule, TraceKeyHandle};
 use crate::{Aid, Eid, Value};
 
 /// Server configuration.
@@ -127,12 +127,12 @@ pub enum Request {
     /// Closes a named input handle.
     CloseInput(String),
     /// Register a query specified as GraphQL.
-    #[cfg(feature="graphql")]
+    #[cfg(feature = "graphql")]
     GraphQl(String, String),
 }
 
 /// Nested value type for graphQL vec -> nested map transformation
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq)]
 enum NestedVal<T: Eq + Hash + Ord> {
     Map(BTreeMap<T, NestedVal<T>>),
@@ -140,7 +140,7 @@ enum NestedVal<T: Eq + Hash + Ord> {
     Val(T),
 }
 
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 impl<T: Eq + Hash + Ord> PartialEq for NestedVal<T> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -152,7 +152,7 @@ impl<T: Eq + Hash + Ord> PartialEq for NestedVal<T> {
     }
 }
 
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 impl<T: Eq + Hash + Ord> PartialOrd for NestedVal<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
@@ -169,7 +169,7 @@ impl<T: Eq + Hash + Ord> PartialOrd for NestedVal<T> {
     }
 }
 
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 fn paths_to_nested<T: Eq + Hash + Ord + std::fmt::Debug>(paths: Vec<Vec<T>>) -> NestedVal<T> {
     let mut acc: BTreeMap<T, NestedVal<T>> = BTreeMap::new();
     for mut path in paths {
@@ -201,7 +201,7 @@ fn paths_to_nested<T: Eq + Hash + Ord + std::fmt::Debug>(paths: Vec<Vec<T>>) -> 
     NestedVal::Map(acc)
 }
 
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 fn squash_nested<T: Eq + Hash + Ord + std::fmt::Debug>(nested: NestedVal<T>) -> NestedVal<T> {
     if let NestedVal::Map(m) = nested {
         let new = m.into_iter().fold(BTreeMap::new(), |mut acc, (k, v)| {
@@ -477,7 +477,7 @@ impl<Token: Hash> Server<Token> {
                 } else if self.config.enable_optimizer == true {
                     let rel_map = implement_neu(name, scope, &mut self.context);
 
-                    for (name, mut trace) in rel_map.into_iter() {
+                    for (name, trace) in rel_map.into_iter() {
                         self.register_global_arrangement(name, trace);
                     }
 
@@ -487,7 +487,7 @@ impl<Token: Hash> Server<Token> {
                 } else {
                     let rel_map = implement(name, scope, &mut self.context);
 
-                    for (name, mut trace) in rel_map.into_iter() {
+                    for (name, trace) in rel_map.into_iter() {
                         self.register_global_arrangement(name, trace);
                     }
 
@@ -645,7 +645,7 @@ impl<Token: Hash> Server<Token> {
     }
 
     /// Register a GraphQL query
-    #[cfg(feature="graphql")]
+    #[cfg(feature = "graphql")]
     pub fn register_graph_ql<S: Scope<Timestamp = u64>>(
         &mut self,
         query: String,
@@ -660,9 +660,12 @@ impl<Token: Hash> Server<Token> {
             publish: vec![name.to_string()],
         };
 
-        self.register(req, scope);
+        self.register(req);
 
         self.interest(name, scope)
+            .import_named(scope, &name)
+            .as_collection(|tuple, _| tuple.clone())
+            .probe_with(&mut self.probe)
             .map(|x| ((), x.to_vec()))
             .group(|_key, inp, out| {
                 let paths: Vec<_> = inp
@@ -674,7 +677,10 @@ impl<Token: Hash> Server<Token> {
 
                 out.push((squash_nested(nested), 1));
             })
-            .map(|(_g, x)| { println!("{:?}", x); x });
+            .map(|(_g, x)| {
+                println!("{:?}", x);
+                x
+            });
     }
 
     /// Helper for registering, publishing, and indicating interest in

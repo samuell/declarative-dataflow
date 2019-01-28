@@ -8,7 +8,7 @@ use timely::dataflow::Scope;
 
 use crate::binding::{AttributeBinding, Binding, ConstantBinding};
 use crate::{Aid, Eid, Value, Var};
-use crate::{Rule, CollectionIndex, CollectionRelation, Relation, RelationHandle, VariableMap};
+use crate::{CollectionIndex, CollectionRelation, Relation, RelationHandle, Rule, VariableMap};
 
 pub mod aggregate;
 pub mod antijoin;
@@ -70,7 +70,7 @@ pub trait ImplContext {
     fn is_underconstrained(&self, name: &str) -> bool;
 }
 
-#[cfg(feature="graphql")]
+#[cfg(feature = "graphql")]
 pub use self::pull::GraphQl;
 
 /// A type that can be implemented as a simple relation.
@@ -134,7 +134,7 @@ pub enum Plan {
     /// Single-level pull expression
     PullLevel(PullLevel<Plan>),
     /// GraphQl pull expression
-    #[cfg(feature="graphql")]
+    #[cfg(feature = "graphql")]
     GraphQl(GraphQl),
 }
 
@@ -157,6 +157,8 @@ impl Plan {
             &Plan::NameExpr(ref variables, ref _name) => variables.clone(),
             &Plan::Pull(ref pull) => pull.variables.clone(),
             &Plan::PullLevel(ref path) => path.variables.clone(),
+            #[cfg(feature = "graphql")]
+            &Plan::GraphQl(ref _q) => unimplemented!(),
         }
     }
 }
@@ -180,6 +182,8 @@ impl Implementable for Plan {
             &Plan::NameExpr(_, ref name) => vec![name.to_string()],
             &Plan::Pull(ref pull) => pull.dependencies(),
             &Plan::PullLevel(ref path) => path.dependencies(),
+            #[cfg(feature = "graphql")]
+            &Plan::GraphQl(ref q) => q.dependencies(),
         }
     }
 
@@ -228,6 +232,8 @@ impl Implementable for Plan {
             &Plan::NameExpr(_, ref _name) => unimplemented!(), // @TODO hmm...
             &Plan::Pull(ref pull) => pull.into_bindings(),
             &Plan::PullLevel(ref path) => path.into_bindings(),
+            #[cfg(feature = "graphql")]
+            &Plan::GraphQl(ref q) => unimplemented!(),
         }
     }
 
@@ -267,6 +273,8 @@ impl Implementable for Plan {
             &Plan::NameExpr(_, ref _name) => Vec::new(),
             &Plan::Pull(ref pull) => pull.datafy(),
             &Plan::PullLevel(ref path) => path.datafy(),
+            #[cfg(feature = "graphql")]
+            &Plan::GraphQl(ref _q) => unimplemented!(),
         }
     }
 
@@ -290,7 +298,7 @@ impl Implementable for Plan {
                 antijoin.implement(nested, local_arrangements, context)
             }
             &Plan::Negate(ref plan) => {
-                let mut rel = plan.implement(nested, local_arrangements, context);
+                let rel = plan.implement(nested, local_arrangements, context);
                 CollectionRelation {
                     symbols: rel.symbols().to_vec(),
                     tuples: rel.tuples().negate(),
@@ -381,8 +389,8 @@ impl Implementable for Plan {
             }
             &Plan::Pull(ref pull) => pull.implement(nested, local_arrangements, context),
             &Plan::PullLevel(ref path) => path.implement(nested, local_arrangements, context),
-            #[cfg(feature="graphql")]
-            &Plan::GraphQl(ref query) => query.implement(nested, local_arrangements, global_arrangements),
+            #[cfg(feature = "graphql")]
+            &Plan::GraphQl(ref query) => query.implement(nested, local_arrangements, context),
         }
     }
 }

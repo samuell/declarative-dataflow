@@ -6,7 +6,7 @@ use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
 
 use crate::plan::{ImplContext, Implementable};
-use crate::{Relation, CollectionRelation, VariableMap};
+use crate::{CollectionRelation, Relation, VariableMap};
 use crate::{Value, Var};
 
 /// Permitted functions.

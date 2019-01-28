@@ -39,18 +39,18 @@ trait PrefixExtender<G: Scope> {
     /// Annotates prefixes with the number of extensions the relation would propose.
     fn count(
         &mut self,
-        &Collection<G, (Self::Prefix, usize, usize)>,
-        usize,
+        prefixes: &Collection<G, (Self::Prefix, usize, usize)>,
+        index: usize,
     ) -> Collection<G, (Self::Prefix, usize, usize)>;
     /// Extends each prefix with corresponding extensions.
     fn propose(
         &mut self,
-        &Collection<G, Self::Prefix>,
+        prefixes: &Collection<G, Self::Prefix>,
     ) -> Collection<G, (Self::Prefix, Self::Extension)>;
     /// Restricts proposed extensions by those the extender would have proposed.
     fn validate(
         &mut self,
-        &Collection<G, (Self::Prefix, Self::Extension)>,
+        extensions: &Collection<G, (Self::Prefix, Self::Extension)>,
     ) -> Collection<G, (Self::Prefix, Self::Extension)>;
 }
 

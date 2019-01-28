@@ -7,7 +7,7 @@ use timely::dataflow::Scope;
 
 pub use crate::binding::{BinaryPredicate as Predicate, BinaryPredicateBinding, Binding};
 use crate::plan::{ImplContext, Implementable};
-use crate::{Relation, CollectionRelation, Value, Var, VariableMap};
+use crate::{CollectionRelation, Relation, Value, Var, VariableMap};
 
 fn lt(a: &Value, b: &Value) -> bool {
     a < b
@@ -58,7 +58,7 @@ impl<P: Implementable> Implementable for Filter<P> {
         //     predicate: self.predicate.clone(),
         // }));
 
-        bindings
+        // bindings
     }
 
     fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
