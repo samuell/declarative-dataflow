@@ -13,9 +13,8 @@ use timely::dataflow::{Scope, Stream};
 
 // use sources::json_file::flate2::read::GzDecoder;
 
-use {Eid, Value};
-
-use sources::Sourceable;
+use crate::{Eid, Value};
+use crate::sources::Sourceable;
 
 /// A local filesystem data source containing JSON objects.
 #[derive(Serialize, Deserialize, Clone, Debug)]

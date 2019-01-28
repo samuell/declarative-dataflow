@@ -22,10 +22,10 @@ use differential_dataflow::operators::Threshold;
 use differential_dataflow::trace::{BatchReader, Cursor, TraceReader};
 use differential_dataflow::{AsCollection, Collection, Data, Hashable};
 
-use binding::{AsBinding, BinaryPredicate, Binding};
-use plan::{ImplContext, Implementable};
-use timestamp::altneu::AltNeu;
-use {CollectionRelation, LiveIndex, Value, Var, VariableMap};
+use crate::binding::{AsBinding, BinaryPredicate, Binding};
+use crate::plan::{ImplContext, Implementable};
+use crate::timestamp::altneu::AltNeu;
+use crate::{CollectionRelation, LiveIndex, Value, Var, VariableMap};
 
 /// A type capable of extending a stream of prefixes. Implementors of
 /// `PrefixExtension` provide types and methods for extending a

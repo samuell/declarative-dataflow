@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
 
-pub use binding::{BinaryPredicate as Predicate, BinaryPredicateBinding, Binding};
-use plan::{ImplContext, Implementable};
-use Relation;
-use {CollectionRelation, Value, Var, VariableMap};
+pub use crate::binding::{BinaryPredicate as Predicate, BinaryPredicateBinding, Binding};
+use crate::plan::{ImplContext, Implementable};
+use crate::{Relation, CollectionRelation, Value, Var, VariableMap};
 
 fn lt(a: &Value, b: &Value) -> bool {
     a < b

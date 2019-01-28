@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
 
-use plan::{ImplContext, Implementable};
-use Relation;
-use {CollectionRelation, Value, Var, VariableMap};
+use crate::plan::{ImplContext, Implementable};
+use crate::{Relation, CollectionRelation, VariableMap};
+use crate::{Value, Var};
 
 /// Permitted functions.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -84,9 +84,9 @@ impl<P: Implementable> Implementable for Transform<P> {
 
                     let mod_val = match interval_param.as_ref() {
                         ":minute" => 60000,
-                        ":hour" => 3600000,
-                        ":day" => 86400000,
-                        ":week" => 604800000,
+                        ":hour" => 3_600_000,
+                        ":day" => 86_400_000,
+                        ":week" => 604_800_000,
                         _ => panic!("Unknown interval for TRUNCATE"),
                     };
 
@@ -108,17 +108,17 @@ impl<P: Implementable> Implementable for Transform<P> {
                             _ => panic!("ADD can only be applied to numbers"),
                         };
 
-                        result = result + summand;
+                        result += summand;
                     }
 
                     // summands (constants)
-                    for (_key, val) in &constants_local {
+                    for val in constants_local.values() {
                         let summand = match val {
                             Value::Number(s) => *s as i64,
                             _ => panic!("ADD can only be applied to numbers"),
                         };
 
-                        result = result + summand;
+                        result += summand;
                     }
 
                     let mut v = tuple.clone();
@@ -153,17 +153,17 @@ impl<P: Implementable> Implementable for Transform<P> {
                             _ => panic!("SUBTRACT can only be applied to numbers"),
                         };
 
-                        result = result - subtrahend;
+                        result -= subtrahend;
                     }
 
                     // subtrahends (constants)
-                    for (_key, val) in &constants_local {
+                    for val in constants_local.values() {
                         let subtrahend = match val {
                             Value::Number(s) => *s as i64,
                             _ => panic!("SUBTRACT can only be applied to numbers"),
                         };
 
-                        result = result - subtrahend;
+                        result -= subtrahend;
                     }
 
                     let mut v = tuple.clone();

@@ -7,17 +7,17 @@ use timely::dataflow::Scope;
 use differential_dataflow::AsCollection;
 
 #[cfg(feature="graphql")]
-use graphql_parser::parse_query;
+use crate::graphql_parser::parse_query;
 
 #[cfg(feature="graphql")]
-use graphql_parser::query::{Definition, Selection, SelectionSet, OperationDefinition, Document};
+use crate::graphql_parser::query::{Definition, Selection, SelectionSet, OperationDefinition, Document};
 
 #[cfg(feature="graphql")]
-use plan::Plan;
+use crate::plan::Plan;
 
-use plan::{ImplContext, Implementable};
-use Relation;
-use {Aid, CollectionRelation, Value, Var, VariableMap};
+use crate::plan::{ImplContext, Implementable};
+use crate::{Relation, CollectionRelation, VariableMap};
+use {Aid, Value, Var};
 
 /// A plan stage for extracting all matching [e a v] tuples for a
 /// given set of attributes and an input relation specifying entities.

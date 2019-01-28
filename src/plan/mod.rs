@@ -6,10 +6,9 @@ use std::sync::atomic::{self, AtomicUsize};
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
 
-use binding::{AttributeBinding, Binding, ConstantBinding};
-use Rule;
-use {Aid, Eid, Value, Var};
-use {CollectionIndex, CollectionRelation, Relation, RelationHandle, VariableMap};
+use crate::binding::{AttributeBinding, Binding, ConstantBinding};
+use crate::{Aid, Eid, Value, Var};
+use crate::{Rule, CollectionIndex, CollectionRelation, Relation, RelationHandle, VariableMap};
 
 pub mod aggregate;
 pub mod antijoin;

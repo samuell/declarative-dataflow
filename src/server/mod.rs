@@ -14,14 +14,13 @@ use differential_dataflow::input::{Input, InputSession};
 use differential_dataflow::trace::TraceReader;
 use differential_dataflow::AsCollection;
 
-use plan::{ImplContext, Implementable};
+use crate::plan::{ImplContext, Implementable};
 #[cfg(feature="graphql")]
-use plan::GraphQl;
-use sources::{Source, Sourceable};
+use crate::plan::GraphQl;
+use crate::sources::{Source, Sourceable};
 
-use Rule;
-use {implement, implement_neu, CollectionIndex, RelationHandle, TraceKeyHandle};
-use {Aid, Eid, Value};
+use crate::{implement, implement_neu, Rule, CollectionIndex, RelationHandle, TraceKeyHandle};
+use crate::{Aid, Eid, Value};
 
 /// Server configuration.
 #[derive(Clone, Debug)]
