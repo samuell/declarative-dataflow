@@ -7,10 +7,13 @@ extern crate getopts;
 extern crate mio;
 #[macro_use]
 extern crate serde_derive;
-extern crate serde_json;
 extern crate slab;
 extern crate timely;
 extern crate ws;
+
+use serde_json;
+#[cfg(feature = "graphql")]
+use serde_json::{json, map, Value};
 
 #[macro_use]
 extern crate log;
@@ -20,7 +23,6 @@ extern crate env_logger;
 extern crate abomonation_derive;
 extern crate abomonation;
 
-use std::collections::VecDeque;
 use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -28,10 +30,10 @@ use std::{thread, usize};
 
 use getopts::Options;
 
-#[cfg(feature = "graphql")]
-use differential_dataflow::operators::Group;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::generic::OutputHandle;
+#[cfg(feature = "graphql")]
+use timely::dataflow::operators::{aggregation::Aggregate, Map};
 use timely::dataflow::operators::{Operator, Probe};
 use timely::synchronization::Sequencer;
 
@@ -39,13 +41,6 @@ use mio::net::TcpListener;
 use mio::*;
 
 use slab::Slab;
-
-#[cfg(feature = "graphql")]
-use std::cmp::{Ordering, PartialEq, PartialOrd};
-#[cfg(feature = "graphql")]
-use std::collections::BTreeMap;
-#[cfg(feature = "graphql")]
-use std::hash::Hash;
 
 use ws::connection::{ConnEvent, Connection};
 
@@ -71,72 +66,10 @@ pub struct Command {
     pub cmd: String,
 }
 
-/// Nested value type for graphQL vec -> nested map transformation
-#[cfg(feature = "graphql")]
-#[derive(Serialize, Deserialize, Debug, Clone, Eq)]
-pub enum NestedVal<T: Eq + Hash + Ord + ToString> {
-    /// An ordered Map Type (similar to a JSON Object)
-    Map(BTreeMap<String, NestedVal<T>>),
-    /// A List Type (similar to a JSON Array)
-    Arr(Vec<NestedVal<T>>),
-    /// A Value Type (similar to a JSON Value)
-    Val(T),
-}
-
-// impl<T: Eq + Hash + Ord + ToString> ToString for NestedVal<T> {
-//     fn to_string(&self) -> String {
-//         match self {
-//             NestedVal::Map(x) => {
-//                 let mut res = format!("{{");
-//                 for (k, v) in x {
-//                     res += k + ":" + v + ",";
-//                 }
-//                 res += "}";
-//                 res
-//             }
-//             NestedVal::Arr(x) => {
-//                 let mut res = format!("[");
-//                 x.iter().map,
-//                 res += "}";
-//                 res
-//             NestedVal::Val(x) => x.to_string(),
-//         }
-//     }
-// }
-
-#[cfg(feature = "graphql")]
-impl<T: Eq + Hash + Ord + ToString> PartialEq for NestedVal<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (&NestedVal::Map(ref a), &NestedVal::Map(ref b)) => a == b,
-            (&NestedVal::Val(ref a), &NestedVal::Val(ref b)) => a == b,
-            (&NestedVal::Arr(ref a), &NestedVal::Arr(ref b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-// #[cfg(feature = "graphql")]
-// impl<T: Eq + Hash + Ord + ToString> PartialOrd for NestedVal<T> {
-//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-//         match (self, other) {
-//             (&NestedVal::Map(ref a), &NestedVal::Map(ref b)) => Some(a.values().cmp(b.values())),
-//             (&NestedVal::Map(_), _) => Some(Ordering::Greater),
-
-//             (&NestedVal::Arr(ref a), &NestedVal::Arr(ref b)) => Some(a.cmp(b)),
-//             (&NestedVal::Arr(_), &NestedVal::Map(_)) => Some(Ordering::Less),
-//             (&NestedVal::Arr(_), &NestedVal::Val(_)) => Some(Ordering::Greater),
-
-//             (&NestedVal::Val(ref a), &NestedVal::Val(ref b)) => Some(a.cmp(b)),
-//             (&NestedVal::Val(_), _) => Some(Ordering::Less),
-//         }
-//     }
-// }
-
 /// Converts a vector of paths to a GraphQL-like nested value
 #[cfg(feature = "graphql")]
-pub fn paths_to_nested<T: Eq + Hash + Ord + ToString>(paths: Vec<Vec<T>>) -> NestedVal<T> {
-    let mut acc: BTreeMap<String, NestedVal<T>> = BTreeMap::new();
+pub fn paths_to_nested(paths: Vec<Vec<declarative_dataflow::Value>>) -> Value {
+    let mut acc = map::Map::new();
     for mut path in paths {
         let mut current_map = &mut acc;
         let last_val = path.pop().unwrap();
@@ -145,38 +78,37 @@ pub fn paths_to_nested<T: Eq + Hash + Ord + ToString>(paths: Vec<Vec<T>>) -> Nes
         for attribute in path {
             let entry = current_map
                 .entry(attribute.to_string())
-                .or_insert_with(|| NestedVal::Map(BTreeMap::new()));
+                .or_insert_with(|| Value::Object(map::Map::new()));
 
             *entry = match entry {
-                NestedVal::Val(_) => NestedVal::Map(BTreeMap::new()),
-                NestedVal::Map(m) => NestedVal::Map(std::mem::replace(m, BTreeMap::new())),
-                NestedVal::Arr(_) => unreachable!(),
+                Value::Object(m) => Value::Object(std::mem::replace(m, map::Map::new())),
+                Value::Array(_) => unreachable!(),
+                _ => Value::Object(map::Map::new()),
             };
 
             match entry {
-                NestedVal::Map(m) => current_map = m,
-                NestedVal::Val(_) => unreachable!(),
-                NestedVal::Arr(_) => unreachable!(),
+                Value::Object(m) => current_map = m,
+                _ => unreachable!(),
             };
         }
 
-        current_map.insert(last_key, NestedVal::Val(last_val));
+        current_map.insert(last_key, json!(last_val));
     }
 
-    NestedVal::Map(acc)
+    Value::Object(acc)
 }
 
 /// Takes a GraphQL-like nested value and squashed eid-Objects into vectors
 #[cfg(feature = "graphql")]
-pub fn squash_nested<T: Eq + Hash + Ord + ToString>(nested: NestedVal<T>) -> NestedVal<T> {
-    if let NestedVal::Map(m) = nested {
-        let new = m.into_iter().fold(BTreeMap::new(), |mut acc, (k, v)| {
-            let to_add = if let NestedVal::Map(nested_v) = v {
-                let nested_squashed_v: Vec<_> = nested_v
+pub fn squash_nested(nested: Value) -> Value {
+    if let Value::Object(m) = nested {
+        let new = m.into_iter().fold(map::Map::new(), |mut acc, (k, v)| {
+            let to_add = if let Value::Object(nested_v) = v {
+                let nested_squashed_v: Vec<Value> = nested_v
                     .into_iter()
                     .map(|(_nested_k, nested_v)| squash_nested(nested_v))
                     .collect();
-                NestedVal::Arr(nested_squashed_v)
+                Value::Array(nested_squashed_v)
             } else {
                 v
             };
@@ -184,7 +116,7 @@ pub fn squash_nested<T: Eq + Hash + Ord + ToString>(nested: NestedVal<T>) -> Nes
             acc.insert(k, to_add);
             acc
         });
-        NestedVal::Map(new)
+        Value::Object(new)
     } else {
         nested
     }
@@ -638,61 +570,41 @@ fn main() {
                                         worker.dataflow::<u64, _, _>(|scope| {
                                             server.register_graph_ql(query, &name, scope);
 
-                                            let df = server
+                                            server
                                                 .interest(&name, scope)
                                                 .import_named(scope, &name)
                                                 .as_collection(|tuple,_| tuple.clone())
-                                                .map(|x| ((), x.to_vec()))
                                                 .inner
-                                                .sink(Pipeline, "Results", move |input| {
-                                                    input.for_each(|_time, data| {
-                                                        let paths: Vec<_> = data
-                                                            .iter()
-                                                            .map(|(tuple, _time, _diff)| tuple.1.clone())
-                                                            .collect();
-
+                                                .map(|x| ((), x))
+                                                // @TODO: filter out short paths while constructing paths
+                                                // @TODO: make sure that everything is collected again on new data
+                                                .aggregate::<_,Vec<_>,_,_,_>(
+                                                    |_key, (path, _time, _diff), acc| { acc.push(path); },
+                                                    |_key, paths| {
                                                         let nested = paths_to_nested(paths);
+                                                        squash_nested(nested)
+                                                    },
+                                                    |_key| 1)
+                                                .unary_notify(
+                                                    Exchange::new(move |_| owner as u64),
+                                                    "ResultsRecv",
+                                                    vec![],
+                                                    move |input, _output: &mut OutputHandle<_, (), _>, _notificator| {
 
-                                                        dbg!(nested);
-                                                    });
-                                                });
+                                                        // due to the exchange pact, this closure is only
+                                                        // executed by the owning worker
 
-                                                // // @TODO clone entire batches instead of flattening
-                                                // .group(|_key, inp, out| {
-                                                //     let paths: Vec<_> = inp
-                                                //         .into_iter()
-                                                //         .map(|(tuple, _diff)| (*tuple).clone())
-                                                //         .collect();
+                                                        input.for_each(|_time, data| {
+                                                            let serialized = serde_json::to_string::<(String, Vec<Value>)>(
+                                                                &(name.clone(), data.to_vec()),
+                                                            ).expect("failed to serialize outputs");
 
-                                                //     let nested = paths_to_nested(paths);
-
-                                                //     out.push((squash_nested(nested), 1));
-                                                // })
-                                                // .map(|(_g, x)| x);
-
-                                                // df.inner
-                                                // .unary_notify(
-                                                //     Exchange::new(move |_| owner as u64),
-                                                //     "ResultsRecv",
-                                                //     vec![],
-                                                //     move |input, _output: &mut OutputHandle<_, (), _>, _notificator| {
-
-                                                //         // due to the exchange pact, this closure is only
-                                                //         // executed by the owning worker
-
-                                                //         input.for_each(|_time, data| {
-                                                //             let serialized = serde_json::to_string::<(String, Vec<_>)>(
-                                                //                 &(name.clone(), data.to_vec()),
-                                                //             ).expect("failed to serialize outputs");
-
-                                                //             println!("{:?}", serialized);
-
-                                                //             send_results_handle
-                                                //                 .send((name.clone(), serialized))
-                                                //                 .unwrap();
-                                                //         });
-                                                //     })
-                                                // .probe_with(&mut server.probe);
+                                                            send_results_handle
+                                                                .send((name.clone(), serialized))
+                                                                .unwrap();
+                                                        });
+                                                    })
+                                                .probe_with(&mut server.probe);
                                         });
                                     }
                                 }
