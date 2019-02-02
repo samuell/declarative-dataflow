@@ -28,6 +28,8 @@ use std::{thread, usize};
 
 use getopts::Options;
 
+#[cfg(feature = "graphql")]
+use differential_dataflow::operators::Group;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::generic::OutputHandle;
 use timely::dataflow::operators::{Operator, Probe};
@@ -37,6 +39,13 @@ use mio::net::TcpListener;
 use mio::*;
 
 use slab::Slab;
+
+#[cfg(feature = "graphql")]
+use std::cmp::{Ordering, PartialEq, PartialOrd};
+#[cfg(feature = "graphql")]
+use std::collections::BTreeMap;
+#[cfg(feature = "graphql")]
+use std::hash::Hash;
 
 use ws::connection::{ConnEvent, Connection};
 
@@ -60,6 +69,125 @@ pub struct Command {
     pub client: Option<usize>,
     /// Unparsed representation of the command.
     pub cmd: String,
+}
+
+/// Nested value type for graphQL vec -> nested map transformation
+#[cfg(feature = "graphql")]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq)]
+pub enum NestedVal<T: Eq + Hash + Ord + ToString> {
+    /// An ordered Map Type (similar to a JSON Object)
+    Map(BTreeMap<String, NestedVal<T>>),
+    /// A List Type (similar to a JSON Array)
+    Arr(Vec<NestedVal<T>>),
+    /// A Value Type (similar to a JSON Value)
+    Val(T),
+}
+
+// impl<T: Eq + Hash + Ord + ToString> ToString for NestedVal<T> {
+//     fn to_string(&self) -> String {
+//         match self {
+//             NestedVal::Map(x) => {
+//                 let mut res = format!("{{");
+//                 for (k, v) in x {
+//                     res += k + ":" + v + ",";
+//                 }
+//                 res += "}";
+//                 res
+//             }
+//             NestedVal::Arr(x) => {
+//                 let mut res = format!("[");
+//                 x.iter().map,
+//                 res += "}";
+//                 res
+//             NestedVal::Val(x) => x.to_string(),
+//         }
+//     }
+// }
+
+#[cfg(feature = "graphql")]
+impl<T: Eq + Hash + Ord + ToString> PartialEq for NestedVal<T> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (&NestedVal::Map(ref a), &NestedVal::Map(ref b)) => a == b,
+            (&NestedVal::Val(ref a), &NestedVal::Val(ref b)) => a == b,
+            (&NestedVal::Arr(ref a), &NestedVal::Arr(ref b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+// #[cfg(feature = "graphql")]
+// impl<T: Eq + Hash + Ord + ToString> PartialOrd for NestedVal<T> {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         match (self, other) {
+//             (&NestedVal::Map(ref a), &NestedVal::Map(ref b)) => Some(a.values().cmp(b.values())),
+//             (&NestedVal::Map(_), _) => Some(Ordering::Greater),
+
+//             (&NestedVal::Arr(ref a), &NestedVal::Arr(ref b)) => Some(a.cmp(b)),
+//             (&NestedVal::Arr(_), &NestedVal::Map(_)) => Some(Ordering::Less),
+//             (&NestedVal::Arr(_), &NestedVal::Val(_)) => Some(Ordering::Greater),
+
+//             (&NestedVal::Val(ref a), &NestedVal::Val(ref b)) => Some(a.cmp(b)),
+//             (&NestedVal::Val(_), _) => Some(Ordering::Less),
+//         }
+//     }
+// }
+
+/// Converts a vector of paths to a GraphQL-like nested value
+#[cfg(feature = "graphql")]
+pub fn paths_to_nested<T: Eq + Hash + Ord + ToString>(paths: Vec<Vec<T>>) -> NestedVal<T> {
+    let mut acc: BTreeMap<String, NestedVal<T>> = BTreeMap::new();
+    for mut path in paths {
+        let mut current_map = &mut acc;
+        let last_val = path.pop().unwrap();
+        let last_key = path.pop().unwrap().to_string();
+
+        for attribute in path {
+            let entry = current_map
+                .entry(attribute.to_string())
+                .or_insert_with(|| NestedVal::Map(BTreeMap::new()));
+
+            *entry = match entry {
+                NestedVal::Val(_) => NestedVal::Map(BTreeMap::new()),
+                NestedVal::Map(m) => NestedVal::Map(std::mem::replace(m, BTreeMap::new())),
+                NestedVal::Arr(_) => unreachable!(),
+            };
+
+            match entry {
+                NestedVal::Map(m) => current_map = m,
+                NestedVal::Val(_) => unreachable!(),
+                NestedVal::Arr(_) => unreachable!(),
+            };
+        }
+
+        current_map.insert(last_key, NestedVal::Val(last_val));
+    }
+
+    NestedVal::Map(acc)
+}
+
+/// Takes a GraphQL-like nested value and squashed eid-Objects into vectors
+#[cfg(feature = "graphql")]
+pub fn squash_nested<T: Eq + Hash + Ord + ToString>(nested: NestedVal<T>) -> NestedVal<T> {
+    if let NestedVal::Map(m) = nested {
+        let new = m.into_iter().fold(BTreeMap::new(), |mut acc, (k, v)| {
+            let to_add = if let NestedVal::Map(nested_v) = v {
+                let nested_squashed_v: Vec<_> = nested_v
+                    .into_iter()
+                    .map(|(_nested_k, nested_v)| squash_nested(nested_v))
+                    .collect();
+                NestedVal::Arr(nested_squashed_v)
+            } else {
+                v
+            };
+
+            acc.insert(k, to_add);
+            acc
+        });
+        NestedVal::Map(new)
+    } else {
+        nested
+    }
 }
 
 fn main() {
@@ -269,8 +397,8 @@ fn main() {
                         }
                     }
                     RESULTS => {
-                        while let Ok((query_name, results)) = recv_results.try_recv() {
-                            info!("[WORKER {}] {:?} {:?}", worker.index(), query_name, results);
+                        while let Ok((query_name, serialized)) = recv_results.try_recv() {
+                            info!("[WORKER {}] {:?} {:?}", worker.index(), query_name, serialized);
 
                             match server.interests.get(&query_name) {
                                 None => {
@@ -278,9 +406,6 @@ fn main() {
                                     info!("NO INTEREST FOR THIS RESULT");
                                 }
                                 Some(tokens) => {
-                                    let serialized = serde_json::to_string::<(String, Vec<Result>)>(
-                                        &(query_name, results),
-                                    ).expect("failed to serialize outputs");
                                     let msg = ws::Message::text(serialized);
 
                                     for &token in tokens.iter() {
@@ -462,8 +587,12 @@ fn main() {
                                                         // executed by the owning worker
 
                                                         input.for_each(|_time, data| {
+                                                            let serialized = serde_json::to_string::<(String, Vec<Result>)>(
+                                                                &(name.clone(), data.to_vec()),
+                                                            ).expect("failed to serialize outputs");
+
                                                             send_results_handle
-                                                                .send((name.clone(), data.to_vec()))
+                                                                .send((name.clone(), serialized))
                                                                 .unwrap();
                                                         });
                                                     })
@@ -486,9 +615,86 @@ fn main() {
                                 Request::CloseInput(name) => server.close_input(name),
                                 #[cfg(feature="graphql")]
                                 Request::GraphQl(name, query) => {
-                                    worker.dataflow::<u64, _, _>(|scope| {
-                                        server.register_graph_ql(query, &name, scope);
-                                    });
+                                    if owner == worker.index() {
+                                        // we are the owning worker and thus have to
+                                        // keep track of this client's new interest
+
+                                        match command.client {
+                                            None => {}
+                                            Some(client) => {
+                                                let client_token = Token(client);
+                                                server.interests
+                                                    .entry(name.clone())
+                                                    .or_insert(Vec::new())
+                                                    .push(client_token);
+                                            }
+                                        }
+                                    }
+
+                                    if !server.context.global_arrangements.contains_key(&name) {
+
+                                        let send_results_handle = send_results.clone();
+
+                                        worker.dataflow::<u64, _, _>(|scope| {
+                                            server.register_graph_ql(query, &name, scope);
+
+                                            let df = server
+                                                .interest(&name, scope)
+                                                .import_named(scope, &name)
+                                                .as_collection(|tuple,_| tuple.clone())
+                                                .map(|x| ((), x.to_vec()))
+                                                .inner
+                                                .sink(Pipeline, "Results", move |input| {
+                                                    input.for_each(|_time, data| {
+                                                        let paths: Vec<_> = data
+                                                            .iter()
+                                                            .map(|(tuple, _time, _diff)| tuple.1.clone())
+                                                            .collect();
+
+                                                        let nested = paths_to_nested(paths);
+
+                                                        dbg!(nested);
+                                                    });
+                                                });
+
+                                                // // @TODO clone entire batches instead of flattening
+                                                // .group(|_key, inp, out| {
+                                                //     let paths: Vec<_> = inp
+                                                //         .into_iter()
+                                                //         .map(|(tuple, _diff)| (*tuple).clone())
+                                                //         .collect();
+
+                                                //     let nested = paths_to_nested(paths);
+
+                                                //     out.push((squash_nested(nested), 1));
+                                                // })
+                                                // .map(|(_g, x)| x);
+
+                                                // df.inner
+                                                // .unary_notify(
+                                                //     Exchange::new(move |_| owner as u64),
+                                                //     "ResultsRecv",
+                                                //     vec![],
+                                                //     move |input, _output: &mut OutputHandle<_, (), _>, _notificator| {
+
+                                                //         // due to the exchange pact, this closure is only
+                                                //         // executed by the owning worker
+
+                                                //         input.for_each(|_time, data| {
+                                                //             let serialized = serde_json::to_string::<(String, Vec<_>)>(
+                                                //                 &(name.clone(), data.to_vec()),
+                                                //             ).expect("failed to serialize outputs");
+
+                                                //             println!("{:?}", serialized);
+
+                                                //             send_results_handle
+                                                //                 .send((name.clone(), serialized))
+                                                //                 .unwrap();
+                                                //         });
+                                                //     })
+                                                // .probe_with(&mut server.probe);
+                                        });
+                                    }
                                 }
                             }
                         }

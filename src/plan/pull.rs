@@ -203,6 +203,7 @@ impl<P: Implementable> Implementable for Pull<P> {
 fn selection_set_to_paths(
     selection_set: &SelectionSet,
     parent_path: &Vec<String>,
+    at_root: bool,
 ) -> Vec<PullLevel<Plan>> {
     let mut result = vec![];
     let mut pull_attributes = vec![];
@@ -217,6 +218,7 @@ fn selection_set_to_paths(
                 result.extend(selection_set_to_paths(
                     &field.selection_set,
                     &new_parent_path,
+                    parent_path.is_empty(),
                 ));
             }
             _ => unimplemented!(),
@@ -225,11 +227,22 @@ fn selection_set_to_paths(
 
     // parent_path handles root path case
     if !pull_attributes.is_empty() && !parent_path.is_empty() {
+        // for root, we expect a NameExpr that puts the pulled IDs in the v position
+        let plan;
+        if at_root {
+            plan = Box::new(Plan::NameExpr(
+                vec![0, 1],
+                parent_path.last().unwrap().to_string(),
+            ));
+        } else {
+            plan = Box::new(Plan::MatchA(0, parent_path.last().unwrap().to_string(), 1));
+        }
+
         let pull_level = PullLevel {
             pull_attributes,
             path_attributes: parent_path.to_vec(),
             variables,
-            plan: Box::new(Plan::MatchA(0, parent_path.last().unwrap().to_string(), 1)),
+            plan,
         };
         result.push(pull_level);
     }
@@ -262,7 +275,7 @@ fn ast_to_paths(ast: Document) -> Vec<PullLevel<Plan>> {
             Definition::Operation(operation_definition) => match operation_definition {
                 OperationDefinition::Query(query) => unimplemented!(),
                 OperationDefinition::SelectionSet(selection_set) => {
-                    result.extend(selection_set_to_paths(selection_set, &vec![]))
+                    result.extend(selection_set_to_paths(selection_set, &vec![], true))
                 }
                 _ => unimplemented!(),
             },
