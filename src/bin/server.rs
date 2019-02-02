@@ -92,7 +92,12 @@ pub fn paths_to_nested(paths: Vec<Vec<declarative_dataflow::Value>>) -> Value {
             };
         }
 
-        current_map.insert(last_key, json!(last_val));
+        match current_map.get(&last_key) {
+            Some(Value::Object(_)) => (),
+            _ => {
+                current_map.insert(last_key, json!(last_val));
+            }
+        };
     }
 
     Value::Object(acc)

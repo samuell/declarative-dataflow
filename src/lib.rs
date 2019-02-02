@@ -85,13 +85,13 @@ pub enum Value {
 impl ToString for Value {
     fn to_string(&self) -> String {
         match self {
-            Value::Aid(x) => format!("{:?}", x),
-            Value::String(x) => format!("{:?}", x),
-            Value::Bool(x) => format!("{:?}", x),
-            Value::Number(x) => format!("{:?}", x),
-            Value::Rational32(x) => format!("{:?}", x),
-            Value::Eid(x) => format!("{:?}", x),
-            Value::Instant(x) => format!("{:?}", x),
+            Value::Aid(x) => x.to_string(),
+            Value::String(x) => x.to_string(),
+            Value::Bool(x) => x.to_string(),
+            Value::Number(x) => x.to_string(),
+            Value::Rational32(x) => x.to_string(),
+            Value::Eid(x) => x.to_string(),
+            Value::Instant(x) => x.to_string(),
             Value::Uuid(x) => format!("{:?}", x),
         }
     }
