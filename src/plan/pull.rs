@@ -53,7 +53,7 @@ pub struct Pull<P: Implementable> {
 }
 
 /// A plan for GraphQL queries, e.g. `{ Heroes { name age weight } }`
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct GraphQl {
     /// String representation of GraphQL query
     pub query: String,
@@ -72,14 +72,14 @@ fn interleave(values: &[Value], constants: &[Aid]) -> Vec<Value> {
 
         for i in 0..size {
             if i % 2 == 0 {
+                // on even indices we take from the result tuple
+                result.push(values[next_value].clone());
+                next_value += 1;
+            } else {
                 // on odd indices we interleave an attribute
                 let a = constants[next_const].clone();
                 result.push(Value::Aid(a));
                 next_const += 1;
-            } else {
-                // on even indices we take from the result tuple
-                result.push(values[next_value].clone());
-                next_value += 1;
             }
         }
 
@@ -310,13 +310,13 @@ fn ast_to_paths(ast: Document) -> Vec<PullLevel<Plan>> {
     for definition in &ast.definitions {
         match definition {
             Definition::Operation(operation_definition) => match operation_definition {
-                OperationDefinition::Query(query) => unimplemented!(),
+                OperationDefinition::Query(_) => unimplemented!(),
                 OperationDefinition::SelectionSet(selection_set) => {
                     result.extend(selection_set_to_paths(selection_set, &vec![], true))
                 }
                 _ => unimplemented!(),
             },
-            Definition::Fragment(fragment_definition) => unimplemented!(),
+            Definition::Fragment(_) => unimplemented!(),
         };
     }
 
@@ -325,7 +325,7 @@ fn ast_to_paths(ast: Document) -> Vec<PullLevel<Plan>> {
 
 #[cfg(feature = "graphql")]
 impl Implementable for GraphQl {
-    fn dependencies(&self) -> Vec<String> {
+    fn dependencies(&self) -> Dependencies {
         // @TODO cache this?
         let ast = parse_query(&self.query).expect("graphQL ast parsing failed");
         let parsed = Pull {
@@ -336,12 +336,17 @@ impl Implementable for GraphQl {
         parsed.dependencies()
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
         let ast = parse_query(&self.query).expect("graphQL ast parsing failed");
         let parsed = Pull {
             variables: vec![],

@@ -38,6 +38,8 @@ use timely::dataflow::operators::{aggregation::Aggregate, Map};
 use timely::dataflow::operators::{Operator, Probe};
 use timely::synchronization::Sequencer;
 
+use timely::dataflow::operators::Inspect;
+
 use mio::net::TcpListener;
 use mio::*;
 
@@ -207,7 +209,7 @@ fn main() {
         let (send_cli, recv_cli) = mio::channel::channel();
 
         // setup results channel
-        let (send_results, recv_results) = mio::channel::channel::<(String, Vec<ResultDiff<u64>>)>();
+        let (send_results, recv_results) = mio::channel::channel::<(String, String)>();
 
         // setup errors channel
         let (send_errors, recv_errors) = mio::channel::channel::<(Vec<Token>, Vec<(Error, u64)>)>();
@@ -384,9 +386,6 @@ fn main() {
                                     warn!("NO INTEREST FOR THIS RESULT");
                                 }
                                 Some(tokens) => {
-                                    let serialized = serde_json::to_string::<(String, Vec<ResultDiff<u64>>)>(
-                                        &(query_name, results),
-                                    ).expect("failed to serialize outputs");
                                     let msg = ws::Message::text(serialized);
 
                                     for &token in tokens.iter() {
@@ -610,7 +609,7 @@ fn main() {
                                                         // executed by the owning worker
 
                                                         input.for_each(|_time, data| {
-                                                            let serialized = serde_json::to_string::<(String, Vec<Result>)>(
+                                                            let serialized = serde_json::to_string::<(String, Vec<ResultDiff<u64>>)>(
                                                                 &(name.clone(), data.to_vec()),
                                                             ).expect("failed to serialize outputs");
 
@@ -661,7 +660,7 @@ fn main() {
                                             }
                                             Ok(relation) => {
                                                 // @TODO Ideally we only ever want to "send" references
-                                                // to local trace batches. 
+                                                // to local trace batches.
                                                 relation
                                                     .inner
                                                     .sink(Pipeline, "Flow", move |input| {
@@ -685,41 +684,36 @@ fn main() {
                                         }
                                     });
                                 }
-                                #[cfg(feature="graphql")]
-                                Request::GraphQl(name, query) => {
-                                    if owner == worker.index() {
-                                        // we are the owning worker and thus have to
-                                        // keep track of this client's new interest
+                            }
+                        }
+                        #[cfg(feature="graphql")]
+                        Request::GraphQl(name, query) => {
+                            let client_token = Token(command.client);
+                            server.interests
+                                .entry(name.clone())
+                                .or_insert_with(HashSet::new)
+                                .insert(client_token);
 
-                                        match command.client {
-                                            None => {}
-                                            Some(client) => {
-                                                let client_token = Token(client);
-                                                server.interests
-                                                    .entry(name.clone())
-                                                    .or_insert(Vec::new())
-                                                    .push(client_token);
-                                            }
+                            if server.context.global_arrangement(&name).is_none() {
+
+                                let send_results_handle = send_results.clone();
+
+                                worker.dataflow::<u64, _, _>(|scope| {
+                                    server.register_graph_ql(query, &name);
+
+                                    match server.interest(&name, scope) {
+                                        Err(error) => {
+                                            send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
                                         }
-                                    }
-
-                                    if !server.context.global_arrangements.contains_key(&name) {
-
-                                        let send_results_handle = send_results.clone();
-
-                                        worker.dataflow::<u64, _, _>(|scope| {
-                                            server.register_graph_ql(query, &name, scope);
-
-                                            server
-                                                .interest(&name, scope)
-                                                .import_named(scope, &name)
-                                                .as_collection(|tuple,_| tuple.clone())
+                                        Ok(relation) => {
+                                            relation
                                                 .inner
                                                 .map(|x| ((), x))
+                                                .inspect(|x| { println!("{:?}", x); })
                                                 .aggregate::<_,Vec<_>,_,_,_>(
                                                     |_key, (path, _time, _diff), acc| { acc.push(path); },
                                                     |_key, paths| {
-                                                       paths_to_nested(paths)
+                                                        paths_to_nested(paths)
                                                         // squash_nested(nested)
                                                     },
                                                     |_key| 1)
@@ -733,9 +727,9 @@ fn main() {
                                                         // executed by the owning worker
 
                                                         input.for_each(|_time, data| {
-                                                            let serialized = serde_json::to_string::<(String, Vec<Value>)>(
+                                                            let serialized = dbg!(serde_json::to_string::<(String, Vec<Value>)>(
                                                                 &(name.clone(), data.to_vec()),
-                                                            ).expect("failed to serialize outputs");
+                                                            ).expect("failed to serialize outputs"));
 
                                                             send_results_handle
                                                                 .send((name.clone(), serialized))
@@ -743,9 +737,9 @@ fn main() {
                                                         });
                                                     })
                                                 .probe_with(&mut server.probe);
-                                        });
+                                        }
                                     }
-                                }
+                                });
                             }
                         }
                         Request::Register(req) => {

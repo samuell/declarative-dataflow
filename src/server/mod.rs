@@ -12,7 +12,6 @@ use differential_dataflow::collection::Collection;
 use differential_dataflow::input::Input;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::TraceReader;
-use differential_dataflow::AsCollection;
 
 #[cfg(feature = "graphql")]
 use crate::plan::{GraphQl, Plan};
@@ -25,7 +24,7 @@ use crate::Rule;
 use crate::{
     implement, implement_neu, AttributeSemantics, CollectionIndex, RelationHandle, ShutdownHandle,
 };
-use crate::{Aid, Eid, Error, TxData, Value};
+use crate::{Aid, Error, TxData, Value};
 
 /// Server configuration.
 #[derive(Clone, Debug)]
@@ -445,12 +444,7 @@ where
 
     /// Register a GraphQL query
     #[cfg(feature = "graphql")]
-    pub fn register_graph_ql<S: Scope<Timestamp = u64>>(
-        &mut self,
-        query: String,
-        name: &str,
-        scope: &mut S,
-    ) {
+    pub fn register_graph_ql(&mut self, query: String, name: &str) {
         let req = Register {
             rules: vec![Rule {
                 name: name.to_string(),
@@ -459,7 +453,7 @@ where
             publish: vec![name.to_string()],
         };
 
-        self.register(req);
+        self.register(req).unwrap();
     }
 
     /// Helper for registering, publishing, and indicating interest in

@@ -292,7 +292,7 @@ impl Implementable for Plan {
             Plan::Pull(ref pull) => pull.into_bindings(),
             Plan::PullLevel(ref path) => path.into_bindings(),
             #[cfg(feature = "graphql")]
-            Plan::GraphQl(ref q) => unimplemented!(),
+            Plan::GraphQl(_) => unimplemented!(),
         }
     }
 

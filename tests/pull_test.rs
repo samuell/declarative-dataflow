@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use timely::Configuration;
 
+#[cfg(feature = "graphql")]
+use declarative_dataflow::plan::GraphQl;
 use declarative_dataflow::plan::{Pull, PullLevel};
 use declarative_dataflow::server::Server;
 use declarative_dataflow::{AttributeSemantics, Plan, Rule, TxData, Value};
-#[cfg(feature = "graphql")]
-use declarative_dataflow::plan::GraphQl;
 use AttributeSemantics::Raw;
 use Value::{Aid, Bool, Eid, Number, String};
 
@@ -403,13 +403,8 @@ fn graph_ql() {
                         plan,
                     },
                 )
-                .inner
-                .sink(Pipeline, "Results", move |input| {
-                    input.for_each(|_time, data| {
-                        for datum in data.iter() {
-                            send_results.send(datum.clone()).unwrap()
-                        }
-                    });
+                .inspect(move |x| {
+                    send_results.send(x.clone()).unwrap();
                 });
         });
 
@@ -444,6 +439,7 @@ fn graph_ql() {
                 Aid("age".to_string()),
                 Number(13),
             ],
+            0,
             1,
         ));
         expected.insert((
@@ -454,6 +450,7 @@ fn graph_ql() {
                 Aid("name".to_string()),
                 String("Mabel".to_string()),
             ],
+            0,
             1,
         ));
         expected.insert((
