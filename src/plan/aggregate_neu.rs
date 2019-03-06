@@ -8,7 +8,7 @@ use timely::progress::Timestamp;
 use differential_dataflow::difference::DiffPair;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::Join as JoinMap;
-use differential_dataflow::operators::{Consolidate, Count, Reduce, Threshold};
+use differential_dataflow::operators::{Count, Reduce};
 
 use crate::binding::Binding;
 use crate::plan::{Dependencies, ImplContext, Implementable};
@@ -124,7 +124,8 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                 let value = &tuple[value_offset];
                 let mut v = vec![value.clone()];
 
-                // With-variables are always the last elements in the value part of each tuple, given they are specified.
+                // With-variables are always the last elements in the
+                // value part of each tuple, given they are specified.
                 // We append these, s.t. we consolidate correctly.
                 if with_length > 0 {
                     v.extend(tuple.iter().rev().take(with_length).cloned());
@@ -135,47 +136,40 @@ impl<P: Implementable> Implementable for Aggregate<P> {
 
             match aggregation_fn {
                 AggregationFn::MIN => {
-                    let tuples = tuples
-                        .map(prepare_unary)
-                        .reduce(|_key, vals, output| {
-                            let min = &vals[0].0[0];
-                            output.push((min.clone(), 1));
-                        })
-                        .map(move |(key, min)| (key, vec![min]));
+                    let tuples = tuples.map(prepare_unary).reduce(|_key, vals, output| {
+                        let min = &vals[0].0[0];
+                        output.push((vec![min.clone()], 1));
+                    });
                     collections.push(tuples);
                 }
                 AggregationFn::MAX => {
-                    let tuples = tuples
-                        .map(prepare_unary)
-                        .reduce(|_key, vals, output| {
-                            let max = &vals[vals.len() - 1].0[0];
-                            output.push((max.clone(), 1));
-                        })
-                        .map(move |(key, max)| (key, vec![max]));
+                    let tuples = tuples.map(prepare_unary).reduce(|_key, vals, output| {
+                        let max = &vals[vals.len() - 1].0[0];
+                        output.push((vec![max.clone()], 1));
+                    });
                     collections.push(tuples);
                 }
                 AggregationFn::MEDIAN => {
-                    let tuples = tuples
-                        .map(prepare_unary)
-                        .reduce(|_key, vals, output| {
-                            let median = &vals[vals.len() / 2].0[0];
-                            output.push((median.clone(), 1));
-                        })
-                        .map(move |(key, med)| (key, vec![med]));
+                    let tuples = tuples.map(prepare_unary).reduce(|_key, vals, output| {
+                        let median = &vals[vals.len() / 2].0[0];
+                        output.push((vec![median.clone()], 1));
+                    });
                     collections.push(tuples);
                 }
                 AggregationFn::COUNT => {
-                    let tuples = tuples
-                        .map(prepare_unary)
-                        .reduce(|_key, input, output| output.push((input.len(), 1)))
-                        .map(move |(key, count)| (key, vec![Value::Number(count as i64)]));
+                    let tuples = tuples.map(prepare_unary).reduce(|_key, input, output| {
+                        let mut total_count = 0;
+                        for (_, count) in input.iter() {
+                            total_count += count;
+                        }
+
+                        output.push((vec![Value::Number(total_count as i64)], 1))
+                    });
                     collections.push(tuples);
                 }
                 AggregationFn::SUM => {
                     let tuples = tuples
                         .map(prepare_unary)
-                        .consolidate()
-                        .distinct()
                         .explode(|(key, val)| {
                             let v = match val[0] {
                                 Value::Number(num) => num,
@@ -190,8 +184,6 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                 AggregationFn::AVG => {
                     let tuples = tuples
                         .map(prepare_unary)
-                        .consolidate()
-                        .distinct()
                         .explode(move |(key, val)| {
                             let v = match val[0] {
                                 Value::Number(num) => num,
@@ -214,8 +206,6 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                 AggregationFn::VARIANCE => {
                     let tuples = tuples
                         .map(prepare_unary)
-                        .consolidate()
-                        .distinct()
                         .explode(move |(key, val)| {
                             let v = match val[0] {
                                 Value::Number(num) => num,
@@ -246,9 +236,9 @@ impl<P: Implementable> Implementable for Aggregate<P> {
             };
         }
 
-        let aggregated = if collections.len() == 1 {
+        if collections.len() == 1 {
             let output_index = output_offsets[0];
-            CollectionRelation {
+            let relation = CollectionRelation {
                 variables: self.variables.to_vec(),
                 tuples: collections[0].map(move |(key, val)| {
                     let mut k = key.clone();
@@ -256,7 +246,9 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                     k.insert(output_index, v);
                     k
                 }),
-            }
+            };
+
+            (relation, shutdown_handle)
         } else {
             // @TODO replace this with a join application
             let left = collections.remove(0);
@@ -268,7 +260,7 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                 })
             });
 
-            CollectionRelation {
+            let relation = CollectionRelation {
                 variables: self.variables.to_vec(),
                 tuples: tuples.map(move |(key, vals)| {
                     let mut v = key.clone();
@@ -277,9 +269,9 @@ impl<P: Implementable> Implementable for Aggregate<P> {
                     }
                     v
                 }),
-            }
-        };
+            };
 
-        (aggregated, shutdown_handle)
+            (relation, shutdown_handle)
+        }
     }
 }

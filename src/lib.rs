@@ -19,24 +19,30 @@ extern crate graphql_parser;
 extern crate num_rational;
 
 pub mod binding;
+pub mod domain;
 pub mod plan;
 pub mod server;
+pub mod sinks;
 pub mod sources;
 pub mod timestamp;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
+use timely::dataflow::operators::CapabilitySet;
 use timely::dataflow::scopes::child::{Child, Iterative};
 use timely::dataflow::*;
-use timely::order::Product;
+use timely::order::{Product, TotalOrder};
 use timely::progress::timestamp::Refines;
 use timely::progress::Timestamp;
 
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::arrange::{Arrange, Arranged, TraceAgent};
-use differential_dataflow::operators::group::Threshold;
+use differential_dataflow::operators::arrange::{Arrange, Arranged, ShutdownButton, TraceAgent};
 use differential_dataflow::operators::iterate::Variable;
+#[cfg(not(feature = "set-semantics"))]
+use differential_dataflow::operators::Consolidate;
+#[cfg(feature = "set-semantics")]
+use differential_dataflow::operators::Threshold;
 use differential_dataflow::trace::implementations::ord::{OrdKeySpine, OrdValSpine};
 use differential_dataflow::trace::wrappers::enter::TraceEnter;
 use differential_dataflow::trace::wrappers::enter_at::TraceEnter as TraceEnterAt;
@@ -45,6 +51,7 @@ use differential_dataflow::{Collection, Data};
 
 pub use num_rational::Rational32;
 
+pub use binding::Binding;
 pub use plan::{Hector, ImplContext, Implementable, Plan};
 
 /// A unique entity identifier.
@@ -82,8 +89,22 @@ pub enum Value {
     Uuid([u8; 16]),
 }
 
+/// A client-facing, non-exceptional error.
+#[derive(Debug)]
+pub struct Error {
+    /// Error category.
+    pub category: &'static str,
+    /// Free-frorm description.
+    pub message: String,
+}
+
+/// Transaction data. Conceptually a pair (Datom, diff) but it's kept
+/// intentionally flat to be more directly compatible with Datomic.
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
+pub struct TxData(pub isize, pub Eid, pub Aid, pub Value);
+
 /// A (tuple, time, diff) triple, as sent back to clients.
-pub type Result = (Vec<Value>, u64, isize);
+pub type ResultDiff<T> = (Vec<Value>, T, isize);
 
 /// An entity, attribute, value triple.
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
@@ -95,16 +116,79 @@ pub type TraceKeyHandle<K, T, R> = TraceAgent<K, (), T, R, OrdKeySpine<K, T, R>>
 /// A trace of (K, V) pairs indexed by key.
 pub type TraceValHandle<K, V, T, R> = TraceAgent<K, V, T, R, OrdValSpine<K, V, T, R>>;
 
-// @TODO change this to TraceValHandle<Eid, Value> eventually
-/// A handle to an arranged attribute.
-pub type AttributeHandle = TraceValHandle<Value, Value, u64, isize>;
-
 /// A handle to an arranged relation.
-pub type RelationHandle = TraceKeyHandle<Vec<Value>, u64, isize>;
+pub type RelationHandle<T> = TraceKeyHandle<Vec<Value>, T, isize>;
 
 // A map for keeping track of collections that are being actively
 // synthesized (i.e. that are not fully defined yet).
 type VariableMap<G> = HashMap<String, Variable<G, Vec<Value>, isize>>;
+
+/// A wrapper around a vector of ShutdownButton's. Ensures they will
+/// be pressed on dropping the handle.
+pub struct ShutdownHandle<T: Timestamp> {
+    shutdown_buttons: Vec<ShutdownButton<CapabilitySet<T>>>,
+}
+
+impl<T: Timestamp> Drop for ShutdownHandle<T> {
+    fn drop(&mut self) {
+        for mut button in self.shutdown_buttons.drain(..) {
+            button.press();
+        }
+    }
+}
+
+impl<T: Timestamp> ShutdownHandle<T> {
+    /// Returns an empty shutdown handle.
+    pub fn empty() -> Self {
+        ShutdownHandle {
+            shutdown_buttons: Vec::new(),
+        }
+    }
+
+    /// Wraps a single shutdown button into a shutdown handle.
+    pub fn from_button(button: ShutdownButton<CapabilitySet<T>>) -> Self {
+        ShutdownHandle {
+            shutdown_buttons: vec![button],
+        }
+    }
+
+    /// Adds another shutdown button to this handle. This button will
+    /// then also be pressed, whenever the handle is shut down or
+    /// dropped.
+    pub fn add_button(&mut self, button: ShutdownButton<CapabilitySet<T>>) {
+        self.shutdown_buttons.push(button);
+    }
+
+    /// Combines the buttons of another handle into self.
+    pub fn merge_with(&mut self, mut other: Self) {
+        self.shutdown_buttons.append(&mut other.shutdown_buttons);
+    }
+
+    /// Combines two shutdown handles into a single one, which will
+    /// control both.
+    pub fn merge(mut left: Self, mut right: Self) -> Self {
+        let mut shutdown_buttons =
+            Vec::with_capacity(left.shutdown_buttons.len() + right.shutdown_buttons.len());
+        shutdown_buttons.append(&mut left.shutdown_buttons);
+        shutdown_buttons.append(&mut right.shutdown_buttons);
+
+        ShutdownHandle { shutdown_buttons }
+    }
+}
+
+/// Attribute indices can have various operations applied to them,
+/// based on their semantics.
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
+pub enum AttributeSemantics {
+    /// No special semantics enforced. Source is responsible for
+    /// everything.
+    Raw,
+    /// Only a single value per eid is allowed at any given timestamp.
+    CardinalityOne,
+    /// Multiple different values for any given eid are allowed, but
+    /// (e,v) pairs are enforced to be distinct.
+    CardinalityMany,
+}
 
 /// Various indices over a collection of (K, V) pairs, required to
 /// participate in delta-join pipelines.
@@ -114,12 +198,12 @@ where
     V: Data,
     T: Lattice + Data,
 {
+    /// A name uniquely identifying this index.
+    pub name: String,
     /// A trace of type (K, ()), used to count extensions for each prefix.
     count_trace: TraceKeyHandle<K, T, isize>,
-
     /// A trace of type (K, V), used to propose extensions for each prefix.
     propose_trace: TraceValHandle<K, V, T, isize>,
-
     /// A trace of type ((K, V), ()), used to validate proposed extensions.
     validate_trace: TraceKeyHandle<(K, V), T, isize>,
 }
@@ -132,6 +216,7 @@ where
 {
     fn clone(&self) -> Self {
         CollectionIndex {
+            name: self.name.clone(),
             count_trace: self.count_trace.clone(),
             propose_trace: self.propose_trace.clone(),
             validate_trace: self.validate_trace.clone(),
@@ -150,22 +235,27 @@ where
         name: &str,
         collection: &Collection<G, (K, V), isize>,
     ) -> Self {
-        let counts = collection
+        let mut count_trace = collection
             .map(|(k, _v)| (k, ()))
             .arrange_named(&format!("Counts({})", name))
             .trace;
-        let propose = collection
+        let mut propose_trace = collection
             .arrange_named(&format!("Proposals({})", &name))
             .trace;
-        let validate = collection
+        let mut validate_trace = collection
             .map(|t| (t, ()))
             .arrange_named(&format!("Validations({})", &name))
             .trace;
 
+        count_trace.distinguish_since(&[]);
+        propose_trace.distinguish_since(&[]);
+        validate_trace.distinguish_since(&[]);
+
         CollectionIndex {
-            count_trace: counts,
-            propose_trace: propose,
-            validate_trace: validate,
+            name: name.to_string(),
+            count_trace,
+            propose_trace,
+            validate_trace,
         }
     }
 
@@ -173,19 +263,42 @@ where
     pub fn import<G: Scope<Timestamp = T>>(
         &mut self,
         scope: &G,
-    ) -> LiveIndex<
-        G,
-        K,
-        V,
-        TraceKeyHandle<K, T, isize>,
-        TraceValHandle<K, V, T, isize>,
-        TraceKeyHandle<(K, V), T, isize>,
-    > {
-        LiveIndex {
-            count_trace: self.count_trace.import(scope),
-            propose_trace: self.propose_trace.import(scope),
-            validate_trace: self.validate_trace.import(scope),
-        }
+    ) -> (
+        LiveIndex<
+            G,
+            K,
+            V,
+            TraceKeyHandle<K, T, isize>,
+            TraceValHandle<K, V, T, isize>,
+            TraceKeyHandle<(K, V), T, isize>,
+        >,
+        ShutdownHandle<T>,
+    ) {
+        let (count, shutdown_count) = self
+            .count_trace
+            .import_core(scope, &format!("Counts({})", self.name));
+        let (propose, shutdown_propose) = self
+            .propose_trace
+            .import_core(scope, &format!("Proposals({})", self.name));
+        let (validate, shutdown_validate) = self
+            .validate_trace
+            .import_core(scope, &format!("Validations({})", self.name));
+
+        let index = LiveIndex {
+            count,
+            propose,
+            validate,
+        };
+
+        let shutdown_buttons = vec![shutdown_count, shutdown_propose, shutdown_validate];
+        (index, ShutdownHandle { shutdown_buttons })
+    }
+
+    /// Advances the traces maintained in this index.
+    pub fn advance_by(&mut self, frontier: &[T]) {
+        self.count_trace.advance_by(frontier);
+        self.propose_trace.advance_by(frontier);
+        self.validate_trace.advance_by(frontier);
     }
 }
 
@@ -200,9 +313,9 @@ where
     TrPropose: TraceReader<K, V, G::Timestamp, isize> + Clone,
     TrValidate: TraceReader<(K, V), (), G::Timestamp, isize> + Clone,
 {
-    count_trace: Arranged<G, K, (), isize, TrCount>,
-    propose_trace: Arranged<G, K, V, isize, TrPropose>,
-    validate_trace: Arranged<G, (K, V), (), isize, TrValidate>,
+    count: Arranged<G, K, (), isize, TrCount>,
+    propose: Arranged<G, K, V, isize, TrPropose>,
+    validate: Arranged<G, (K, V), (), isize, TrValidate>,
 }
 
 impl<G, K, V, TrCount, TrPropose, TrValidate> Clone
@@ -218,9 +331,9 @@ where
 {
     fn clone(&self) -> Self {
         LiveIndex {
-            count_trace: self.count_trace.clone(),
-            propose_trace: self.propose_trace.clone(),
-            validate_trace: self.validate_trace.clone(),
+            count: self.count.clone(),
+            propose: self.propose.clone(),
+            validate: self.validate.clone(),
         }
     }
 }
@@ -257,9 +370,9 @@ where
         TInner: Refines<G::Timestamp> + Lattice + Timestamp + Clone + Default + 'static,
     {
         LiveIndex {
-            count_trace: self.count_trace.enter(child),
-            propose_trace: self.propose_trace.enter(child),
-            validate_trace: self.validate_trace.enter(child),
+            count: self.count.enter(child),
+            propose: self.propose.enter(child),
+            validate: self.validate.enter(child),
         }
     }
 
@@ -291,18 +404,18 @@ where
         FValidate: Fn(&(K, V), &(), &G::Timestamp) -> TInner + 'static,
     {
         LiveIndex {
-            count_trace: self.count_trace.enter_at(child, fcount),
-            propose_trace: self.propose_trace.enter_at(child, fpropose),
-            validate_trace: self.validate_trace.enter_at(child, fvalidate),
+            count: self.count.enter_at(child, fcount),
+            propose: self.propose.enter_at(child, fpropose),
+            validate: self.validate.enter_at(child, fvalidate),
         }
     }
 }
 
-/// A symbol used in a query.
+/// A variable used in a query.
 type Var = u32;
 
 /// A named relation.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Rule {
     /// The name identifying the relation.
     pub name: String,
@@ -310,39 +423,42 @@ pub struct Rule {
     pub plan: Plan,
 }
 
-/// A relation between a set of symbols.
+/// A relation between a set of variables.
 ///
 /// Relations can be backed by a collection of records of type
 /// `Vec<Value>`, each of a common length (with offsets corresponding
-/// to the symbol offsets), or by an existing arrangement.
+/// to the variable offsets), or by an existing arrangement.
 trait Relation<'a, G: Scope>
 where
     G::Timestamp: Lattice + Data,
 {
     /// List the variable identifiers.
-    fn symbols(&self) -> &[Var];
+    fn variables(&self) -> &[Var];
 
     /// A collection containing all tuples.
     fn tuples(self) -> Collection<Iterative<'a, G, u64>, Vec<Value>, isize>;
 
-    /// Returns the offset at which values for this symbol occur.
-    fn offset(&self, sym: &Var) -> usize {
-        self.symbols().iter().position(|&x| *sym == x).unwrap()
+    /// Returns the offset at which values for this variable occur.
+    fn offset(&self, variable: Var) -> usize {
+        self.variables()
+            .iter()
+            .position(move |&x| variable == x)
+            .unwrap()
     }
 
-    /// A collection with tuples partitioned by `syms`.
+    /// A collection with tuples partitioned by `variables`.
     ///
-    /// Variables present in `syms` are collected in order and populate a first "key"
-    /// `Vec<Value>`, followed by those variables not present in `syms`.
-    fn tuples_by_symbols(
+    /// Variables present in `variables` are collected in order and populate a first "key"
+    /// `Vec<Value>`, followed by those variables not present in `variables`.
+    fn tuples_by_variables(
         self,
-        syms: &[Var],
+        variables: &[Var],
     ) -> Collection<Iterative<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>;
 
     /// @TODO
-    fn arrange_by_symbols(
+    fn arrange_by_variables(
         self,
-        syms: &[Var],
+        variables: &[Var],
     ) -> Arranged<
         Iterative<'a, G, u64>,
         Vec<Value>,
@@ -354,7 +470,7 @@ where
 
 /// A collection and variable bindings.
 pub struct CollectionRelation<'a, G: Scope> {
-    symbols: Vec<Var>,
+    variables: Vec<Var>,
     tuples: Collection<Iterative<'a, G, u64>, Vec<Value>, isize>,
 }
 
@@ -362,45 +478,50 @@ impl<'a, G: Scope> Relation<'a, G> for CollectionRelation<'a, G>
 where
     G::Timestamp: Lattice + Data,
 {
-    fn symbols(&self) -> &[Var] {
-        &self.symbols
+    fn variables(&self) -> &[Var] {
+        &self.variables
     }
 
     fn tuples(self) -> Collection<Iterative<'a, G, u64>, Vec<Value>, isize> {
         self.tuples
     }
 
-    /// Separates tuple fields by those in `syms` and those not.
+    /// Separates tuple fields by those in `variables` and those not.
     ///
     /// Each tuple is mapped to a pair `(Vec<Value>, Vec<Value>)`
-    /// containing first exactly those symbols in `syms` in that
+    /// containing first exactly those variables in `variables` in that
     /// order, followed by the remaining values in their original
     /// order.
-    fn tuples_by_symbols(
+    fn tuples_by_variables(
         self,
-        syms: &[Var],
+        variables: &[Var],
     ) -> Collection<Iterative<'a, G, u64>, (Vec<Value>, Vec<Value>), isize> {
-        if syms == &self.symbols()[..] {
+        if variables == &self.variables()[..] {
             self.tuples().map(|x| (x, Vec::new()))
-        } else if syms.is_empty() {
+        } else if variables.is_empty() {
             self.tuples().map(|x| (Vec::new(), x))
         } else {
-            let key_length = syms.len();
-            let values_length = self.symbols().len() - key_length;
+            let key_length = variables.len();
+            let values_length = self.variables().len() - key_length;
 
             let mut key_offsets: Vec<usize> = Vec::with_capacity(key_length);
             let mut value_offsets: Vec<usize> = Vec::with_capacity(values_length);
-            let sym_set: HashSet<Var> = syms.iter().cloned().collect();
+            let variable_set: HashSet<Var> = variables.iter().cloned().collect();
 
-            // It is important to preserve the key symbols in the order
+            // It is important to preserve the key variables in the order
             // they were specified.
-            for sym in syms.iter() {
-                key_offsets.push(self.symbols().iter().position(|&v| *sym == v).unwrap());
+            for variable in variables.iter() {
+                key_offsets.push(
+                    self.variables()
+                        .iter()
+                        .position(|&v| *variable == v)
+                        .unwrap(),
+                );
             }
 
             // Values we'll just take in the order they were.
-            for (idx, sym) in self.symbols().iter().enumerate() {
-                if sym_set.contains(sym) == false {
+            for (idx, variable) in self.variables().iter().enumerate() {
+                if !variable_set.contains(variable) {
                     value_offsets.push(idx);
                 }
             }
@@ -420,9 +541,9 @@ where
         }
     }
 
-    fn arrange_by_symbols(
+    fn arrange_by_variables(
         self,
-        syms: &[Var],
+        variables: &[Var],
     ) -> Arranged<
         Iterative<'a, G, u64>,
         Vec<Value>,
@@ -430,7 +551,7 @@ where
         isize,
         TraceValHandle<Vec<Value>, Vec<Value>, Product<G::Timestamp, u64>, isize>,
     > {
-        self.tuples_by_symbols(syms).arrange()
+        self.tuples_by_variables(variables).arrange()
     }
 }
 
@@ -439,7 +560,7 @@ where
 // where
 //     G::Timestamp: Lattice+Data
 // {
-//     symbols: Vec<Var>,
+//     variables: Vec<Var>,
 //     tuples: Arranged<Iterative<'a, G, u64>, Vec<Value>, Vec<Value>, isize,
 //                      TraceValHandle<Vec<Value>, Vec<Value>, Product<G::Timestamp,u64>, isize>>,
 // }
@@ -448,50 +569,50 @@ where
 // where
 //     G::Timestamp: Lattice+Data,
 // {
-//     fn symbols(&self) -> &[Var] { &self.symbols }
+//     fn variables(&self) -> &[Var] { &self.variables }
 
 //     fn tuples(self) -> Collection<Iterative<'a, G, u64>, Vec<Value>, isize> {
 //         unimplemented!()
 //         self.tuples
 //     }
 
-//     /// Separates tuple fields by those in `syms` and those not.
+//     /// Separates tuple fields by those in `variables` and those not.
 //     ///
 //     /// Each tuple is mapped to a pair `(Vec<Value>, Vec<Value>)`
-//     /// containing first exactly those symbols in `syms` in that
+//     /// containing first exactly those variables in `variables` in that
 //     /// order, followed by the remaining values in their original
 //     /// order.
-//     fn tuples_by_symbols
-//         (self, syms: &[Var]) -> Collection<Iterative<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>
+//     fn tuples_by_variables
+//         (self, variables: &[Var]) -> Collection<Iterative<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>
 //     {
-//         self.arrange_by_symbols(syms).as_collection(|key,rest| (key,rest))
+//         self.arrange_by_variables(variables).as_collection(|key,rest| (key,rest))
 //     }
 
-//     fn arrange_by_symbols
-//         (self, syms: &[Var]) -> Arranged<Iterative<'a, G, u64>, Vec<Value>, Vec<Value>, isize,
+//     fn arrange_by_variables
+//         (self, variables: &[Var]) -> Arranged<Iterative<'a, G, u64>, Vec<Value>, Vec<Value>, isize,
 //                                          TraceValHandle<Vec<Value>, Vec<Value>, Product<G::Timestamp,u64>, isize>>
 //     {
-//         if syms == &self.symbols()[..] {
+//         if variables == &self.variables()[..] {
 //             self.tuples().map(|x| (x, Vec::new()))
-//         } else if syms.is_empty() {
+//         } else if variables.is_empty() {
 //             self.tuples().map(|x| (Vec::new(), x))
 //         } else {
-//             let key_length = syms.len();
-//             let values_length = self.symbols().len() - key_length;
+//             let key_length = variables.len();
+//             let values_length = self.variables().len() - key_length;
 
 //             let mut key_offsets: Vec<usize> = Vec::with_capacity(key_length);
 //             let mut value_offsets: Vec<usize> = Vec::with_capacity(values_length);
-//             let sym_set: HashSet<Var> = syms.iter().cloned().collect();
+//             let variable_set: HashSet<Var> = variables.iter().cloned().collect();
 
-//             // It is important to preserve the key symbols in the order
+//             // It is important to preserve the key variables in the order
 //             // they were specified.
-//             for sym in syms.iter() {
-//                 key_offsets.push(self.symbols().iter().position(|&v| *sym == v).unwrap());
+//             for variable in variables.iter() {
+//                 key_offsets.push(self.variables().iter().position(|&v| *variable == v).unwrap());
 //             }
 
 //             // Values we'll just take in the order they were.
-//             for (idx, sym) in self.symbols().iter().enumerate() {
-//                 if sym_set.contains(sym) == false {
+//             for (idx, variable) in self.variables().iter().enumerate() {
+//                 if !variable_set.contains(variable) {
 //                     value_offsets.push(idx);
 //                 }
 //             }
@@ -512,118 +633,217 @@ where
 //     }
 // }
 
+/// Helper function to create a query plan. The resulting query will
+/// provide values for the requested target variables, under the
+/// constraints expressed by the bindings provided.
+pub fn q(target_variables: Vec<Var>, bindings: Vec<Binding>) -> Plan {
+    Plan::Hector(Hector {
+        variables: target_variables,
+        bindings,
+    })
+}
+
 /// Returns a deduplicates list of all rules used in the definition of
 /// the specified names. Includes the specified names.
-pub fn collect_dependencies<I: ImplContext>(context: &I, names: &[&str]) -> Vec<Rule> {
+pub fn collect_dependencies<T, I>(context: &I, names: &[&str]) -> Result<Vec<Rule>, Error>
+where
+    T: Timestamp + Lattice + TotalOrder,
+    I: ImplContext<T>,
+{
     let mut seen = HashSet::new();
     let mut rules = Vec::new();
     let mut queue = VecDeque::new();
 
     for name in names {
-        seen.insert(name.to_string());
-        queue.push_back(context.rule(name).expect("unknown rule").clone());
+        match context.rule(name) {
+            None => {
+                return Err(Error {
+                    category: "df.error.category/not-found",
+                    message: format!("Unknown rule {}.", name),
+                });
+            }
+            Some(rule) => {
+                seen.insert(name.to_string());
+                queue.push_back(rule.clone());
+            }
+        }
     }
 
     while let Some(next) = queue.pop_front() {
-        for dep_name in next.plan.dependencies().iter() {
+        let dependencies = next.plan.dependencies();
+        for dep_name in dependencies.names.iter() {
             if !seen.contains(dep_name) {
-                seen.insert(dep_name.to_string());
-                queue.push_back(context.rule(dep_name).expect("unknown dependency").clone());
+                match context.rule(dep_name) {
+                    None => {
+                        return Err(Error {
+                            category: "df.error.category/not-found",
+                            message: format!("Unknown rule {}.", dep_name),
+                        });
+                    }
+                    Some(rule) => {
+                        seen.insert(dep_name.to_string());
+                        queue.push_back(rule.clone());
+                    }
+                }
+            }
+        }
+
+        // Ensure all required attributes exist.
+        for aid in dependencies.attributes.iter() {
+            if !context.has_attribute(aid) {
+                return Err(Error {
+                    category: "df.error.category/not-found",
+                    message: format!("Rule depends on unknown attribute {}.", aid),
+                });
             }
         }
 
         rules.push(next);
     }
 
-    rules
+    Ok(rules)
 }
 
 /// Takes a query plan and turns it into a differential dataflow.
-pub fn implement<S: Scope<Timestamp = u64>, I: ImplContext>(
+pub fn implement<T, I, S>(
     name: &str,
     scope: &mut S,
     context: &mut I,
-) -> HashMap<String, RelationHandle> {
+) -> Result<
+    (
+        HashMap<String, Collection<S, Vec<Value>, isize>>,
+        ShutdownHandle<T>,
+    ),
+    Error,
+>
+where
+    T: Timestamp + Lattice + TotalOrder + Default,
+    I: ImplContext<T>,
+    S: Scope<Timestamp = T>,
+{
     scope.iterative::<u64, _, _>(|nested| {
         let publish = vec![name];
-        let mut rules = collect_dependencies(&*context, &publish[..]);
+        let mut rules = collect_dependencies(&*context, &publish[..])?;
 
         let mut local_arrangements = VariableMap::new();
         let mut result_map = HashMap::new();
 
         // Step 0: Canonicalize, check uniqueness of bindings.
         if rules.is_empty() {
-            panic!("Couldn't find any rules for that name.");
+            return Err(Error {
+                category: "df.error.category/not-found",
+                message: format!("Couldn't find any rules for name {}.", name),
+            });
         }
 
         rules.sort_by(|x, y| x.name.cmp(&y.name));
         for index in 1..rules.len() - 1 {
             if rules[index].name == rules[index - 1].name {
-                panic!("Duplicate rule definitions for rule {}", rules[index].name);
+                return Err(Error {
+                    category: "df.error.category/conflict",
+                    message: format!("Duplicate rule definitions for rule {}", rules[index].name),
+                });
             }
         }
 
         // Step 1: Create new recursive variables for each rule.
         for rule in rules.iter() {
-            local_arrangements.insert(rule.name.clone(), Variable::new(nested, Product::new(0, 1)));
+            if context.is_underconstrained(&rule.name) {
+                local_arrangements.insert(
+                    rule.name.clone(),
+                    Variable::new(nested, Product::new(Default::default(), 1)),
+                );
+            }
         }
 
         // Step 2: Create public arrangements for published relations.
         for name in publish.into_iter() {
             if let Some(relation) = local_arrangements.get(name) {
-                let trace = relation.leave().map(|t| (t, ())).arrange_named(name).trace;
-
-                result_map.insert(name.to_string(), trace);
+                result_map.insert(name.to_string(), relation.leave());
             } else {
-                panic!("Attempted to publish undefined name {:?}", name);
+                return Err(Error {
+                    category: "df.error.category/not-found",
+                    message: format!("Attempted to publish undefined name {}.", name),
+                });
             }
         }
 
         // Step 3: Define the executions for each rule.
         let mut executions = Vec::with_capacity(rules.len());
+        let mut shutdown_handle = ShutdownHandle::empty();
         for rule in rules.iter() {
             info!("planning {:?}", rule.name);
-            executions.push(rule.plan.implement(nested, &local_arrangements, context));
+            let (relation, shutdown) = rule.plan.implement(nested, &local_arrangements, context);
+
+            executions.push(relation);
+            shutdown_handle.merge_with(shutdown);
         }
 
         // Step 4: Complete named relations in a specific order (sorted by name).
         for (rule, execution) in rules.iter().zip(executions.drain(..)) {
-            local_arrangements
-                .remove(&rule.name)
-                .expect("Rule should be in local_arrangements, but isn't")
-                .set(&execution.tuples().distinct());
+            match local_arrangements.remove(&rule.name) {
+                None => {
+                    return Err(Error {
+                        category: "df.error.category/not-found",
+                        message: format!(
+                            "Rule {} should be in local arrangements, but isn't.",
+                            &rule.name
+                        ),
+                    });
+                }
+                Some(variable) => {
+                    #[cfg(feature = "set-semantics")]
+                    variable.set(&execution.tuples().distinct());
+
+                    #[cfg(not(feature = "set-semantics"))]
+                    variable.set(&execution.tuples().consolidate());
+                }
+            }
         }
 
-        result_map
+        Ok((result_map, shutdown_handle))
     })
 }
 
 /// @TODO
-pub fn implement_neu<S, I>(
+pub fn implement_neu<T, I, S>(
     name: &str,
     scope: &mut S,
     context: &mut I,
-) -> HashMap<String, RelationHandle>
+) -> Result<
+    (
+        HashMap<String, Collection<S, Vec<Value>, isize>>,
+        ShutdownHandle<T>,
+    ),
+    Error,
+>
 where
-    S: Scope<Timestamp = u64>,
-    I: ImplContext,
+    T: Timestamp + Lattice + TotalOrder + Default,
+    I: ImplContext<T>,
+    S: Scope<Timestamp = T>,
 {
     scope.iterative::<u64, _, _>(move |nested| {
         let publish = vec![name];
-        let mut rules = collect_dependencies(&*context, &publish[..]);
+        let mut rules = collect_dependencies(&*context, &publish[..])?;
 
         let mut local_arrangements = VariableMap::new();
         let mut result_map = HashMap::new();
 
         // Step 0: Canonicalize, check uniqueness of bindings.
         if rules.is_empty() {
-            panic!("Couldn't find any rules for that name.");
+            return Err(Error {
+                category: "df.error.category/not-found",
+                message: format!("Couldn't find any rules for name {}.", name),
+            });
         }
 
         rules.sort_by(|x, y| x.name.cmp(&y.name));
         for index in 1..rules.len() - 1 {
             if rules[index].name == rules[index - 1].name {
-                panic!("Duplicate rule definitions for rule {}", rules[index].name);
+                return Err(Error {
+                    category: "df.error.category/conflict",
+                    message: format!("Duplicate rule definitions for rule {}", rules[index].name),
+                });
             }
         }
 
@@ -637,44 +857,58 @@ where
 
         // Step 1: Create new recursive variables for each rule.
         for name in publish.iter() {
-            local_arrangements.insert(name.to_string(), Variable::new(nested, Product::new(0, 1)));
+            if context.is_underconstrained(name) {
+                local_arrangements.insert(
+                    name.to_string(),
+                    Variable::new(nested, Product::new(Default::default(), 1)),
+                );
+            }
         }
 
         // Step 2: Create public arrangements for published relations.
         for name in publish.into_iter() {
             if let Some(relation) = local_arrangements.get(name) {
-                let trace = relation.leave().map(|t| (t, ())).arrange_named(name).trace;
-
-                result_map.insert(name.to_string(), trace);
+                result_map.insert(name.to_string(), relation.leave());
             } else {
-                panic!("Attempted to publish undefined name {:?}", name);
+                return Err(Error {
+                    category: "df.error.category/not-found",
+                    message: format!("Attempted to publish undefined name {}.", name),
+                });
             }
         }
 
         // Step 3: Define the executions for each rule.
         let mut executions = Vec::with_capacity(rules.len());
+        let mut shutdown_handle = ShutdownHandle::empty();
         for rule in rules.iter() {
             info!("neu_planning {:?}", rule.name);
 
-            // @TODO here we need to split up the plan into multiple
-            // Hector plans (one for each symbol)
+            let plan = q(rule.plan.variables(), rule.plan.into_bindings());
 
-            let plan = Plan::Hector(Hector {
-                variables: rule.plan.variables(),
-                bindings: rule.plan.into_bindings(),
-            });
+            let (relation, shutdown) = plan.implement(nested, &local_arrangements, context);
 
-            executions.push(plan.implement(nested, &local_arrangements, context));
+            executions.push(relation);
+            shutdown_handle.merge_with(shutdown);
         }
 
         // Step 4: Complete named relations in a specific order (sorted by name).
         for (rule, execution) in rules.iter().zip(executions.drain(..)) {
-            local_arrangements
-                .remove(&rule.name)
-                .expect("Rule should be in local_arrangements, but isn't")
-                .set(&execution.tuples().distinct());
+            match local_arrangements.remove(&rule.name) {
+                None => {
+                    return Err(Error {
+                        category: "df.error.category/not-found",
+                        message: format!(
+                            "Rule {} should be in local arrangements, but isn't.",
+                            &rule.name
+                        ),
+                    });
+                }
+                Some(variable) => {
+                    variable.set(&execution.tuples().consolidate());
+                }
+            }
         }
 
-        result_map
+        Ok((result_map, shutdown_handle))
     })
 }

@@ -23,6 +23,7 @@ extern crate env_logger;
 extern crate abomonation_derive;
 extern crate abomonation;
 
+use std::collections::{HashSet, VecDeque};
 use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use std::{thread, usize};
 
 use getopts::Options;
 
-use timely::dataflow::channels::pact::Exchange;
+use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::generic::OutputHandle;
 #[cfg(feature = "graphql")]
 use timely::dataflow::operators::{aggregation::Aggregate, Map};
@@ -45,25 +46,25 @@ use slab::Slab;
 use ws::connection::{ConnEvent, Connection};
 
 use declarative_dataflow::server::{Config, CreateAttribute, Request, Server};
-use declarative_dataflow::Result;
+use declarative_dataflow::{Error, ImplContext, ResultDiff};
 
 const SERVER: Token = Token(usize::MAX - 1);
 const RESULTS: Token = Token(usize::MAX - 2);
-const CLI: Token = Token(usize::MAX - 3);
+const ERRORS: Token = Token(usize::MAX - 3);
+const SYSTEM: Token = Token(usize::MAX - 4);
+const CLI: Token = Token(usize::MAX - 5);
 
 /// A mutation of server state.
-#[derive(
-    Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Serialize, Deserialize, Debug,
-)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Serialize, Deserialize, Debug)]
 pub struct Command {
     /// The worker that received this command from a client originally
     /// and is therefore the one that should receive all outputs.
     pub owner: usize,
     /// The client token that issued the command. Only relevant to the
     /// owning worker, as no one else has the connection.
-    pub client: Option<usize>,
-    /// Unparsed representation of the command.
-    pub cmd: String,
+    pub client: usize,
+    /// Requests issued by the client.
+    pub requests: Vec<Request>,
 }
 
 /// Converts a vector of paths to a GraphQL-like nested value
@@ -142,17 +143,22 @@ fn main() {
 
     let mut opts = Options::new();
     opts.optopt("", "port", "server port", "PORT");
+    opts.optflag(
+        "",
+        "manual-advance",
+        "forces clients to call AdvanceDomain explicitely",
+    );
     opts.optflag("", "enable-cli", "enable the CLI interface");
     opts.optflag("", "enable-history", "enable historical queries");
     opts.optflag("", "enable-optimizer", "enable WCO queries");
     opts.optflag("", "enable-meta", "enable queries on the query graph");
 
     let args: Vec<String> = std::env::args().collect();
-    let timely_args = std::env::args().take_while(|ref arg| arg.to_string() != "--");
+    let timely_args = std::env::args().take_while(|ref arg| *arg != "--");
 
     timely::execute_from_args(timely_args, move |worker| {
         // read configuration
-        let server_args = args.iter().rev().take_while(|arg| arg.to_string() != "--");
+        let server_args = args.iter().rev().take_while(|arg| *arg != "--");
         let default_config: Config = Default::default();
         let config = match opts.parse(server_args) {
             Err(err) => panic!(err),
@@ -164,6 +170,7 @@ fn main() {
 
                 Config {
                     port: starting_port + (worker.index() as u16),
+                    manual_advance: matches.opt_present("manual-advance"),
                     enable_cli: matches.opt_present("enable-cli"),
                     enable_history: matches.opt_present("enable-history"),
                     enable_optimizer: matches.opt_present("enable-optimizer"),
@@ -173,22 +180,22 @@ fn main() {
         };
 
         // setup interpretation context
-        let mut server = Server::<Token>::new(config.clone());
+        let mut server = Server::<u64, Token>::new(config.clone());
 
         // The server might specify a sequence of requests for
         // setting-up built-in arrangements. We serialize those here
         // and pre-load the sequencer with them, such that they will
         // flow through the regular request handling.
-        let builtins = Server::<Token>::builtins();
+        let builtins = Server::<u64, Token>::builtins();
         let preload_command = Command {
             owner: worker.index(),
-            client: None,
-            cmd: serde_json::to_string::<Vec<Request>>(&builtins).expect("failed to serialize built-in request"),
+            client: SYSTEM.0,
+            requests: builtins,
         };
-        
+
         // setup serialized command queue (shared between all workers)
         let mut sequencer: Sequencer<Command> =
-            Sequencer::new(worker, Instant::now(), VecDeque::from(vec![preload_command]));
+            Sequencer::preloaded(worker, Instant::now(), VecDeque::from(vec![preload_command]));
 
         // configure websocket server
         let ws_settings = ws::Settings {
@@ -200,7 +207,10 @@ fn main() {
         let (send_cli, recv_cli) = mio::channel::channel();
 
         // setup results channel
-        let (send_results, recv_results) = mio::channel::channel();
+        let (send_results, recv_results) = mio::channel::channel::<(String, Vec<ResultDiff<u64>>)>();
+
+        // setup errors channel
+        let (send_errors, recv_errors) = mio::channel::channel::<(Vec<Token>, Vec<(Error, u64)>)>();
 
         // setup server socket
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), config.port);
@@ -238,6 +248,14 @@ fn main() {
             Ready::readable(),
             PollOpt::edge() | PollOpt::oneshot(),
         ).unwrap();
+
+        poll.register(
+            &recv_errors,
+            ERRORS,
+            Ready::readable(),
+            PollOpt::edge() | PollOpt::oneshot(),
+        ).unwrap();
+
         poll.register(&server_socket, SERVER, Ready::readable(), PollOpt::level())
             .unwrap();
 
@@ -246,6 +264,9 @@ fn main() {
             worker.index(),
             config
         );
+
+        // Sequence counter for commands.
+        let mut next_tx: u64 = 0;
 
         loop {
             // each worker has to...
@@ -278,13 +299,23 @@ fn main() {
                 match event.token() {
                     CLI => {
                         while let Ok(cli_input) = recv_cli.try_recv() {
-                            let command = Command {
-                                owner: worker.index(),
-                                client: None,
-                                cmd: cli_input,
-                            };
+                            match serde_json::from_str::<Vec<Request>>(&cli_input) {
+                                Err(serde_error) => {
+                                    let error = Error {
+                                        category: "df.error.category/incorrect",
+                                        message: serde_error.to_string(),
+                                    };
 
-                            sequencer.push(command);
+                                    send_errors.send((vec![], vec![(error, next_tx - 1)])).unwrap();
+                                }
+                                Ok(requests) => {
+                                    sequencer.push(Command {
+                                        owner: worker.index(),
+                                        client: SYSTEM.0,
+                                        requests,
+                                    });
+                                }
+                            }
                         }
 
                         poll.reregister(
@@ -350,15 +381,17 @@ fn main() {
                             match server.interests.get(&query_name) {
                                 None => {
                                     /* @TODO unregister this flow */
-                                    info!("NO INTEREST FOR THIS RESULT");
+                                    warn!("NO INTEREST FOR THIS RESULT");
                                 }
                                 Some(tokens) => {
+                                    let serialized = serde_json::to_string::<(String, Vec<ResultDiff<u64>>)>(
+                                        &(query_name, results),
+                                    ).expect("failed to serialize outputs");
                                     let msg = ws::Message::text(serialized);
 
                                     for &token in tokens.iter() {
                                         // @TODO check whether connection still exists
                                         let conn = &mut connections[token.into()];
-                                        info!("[WORKER {}] sending msg {:?}", worker.index(), msg);
 
                                         conn.send_message(msg.clone())
                                             .expect("failed to send message");
@@ -377,6 +410,46 @@ fn main() {
                         poll.reregister(
                             &recv_results,
                             RESULTS,
+                            Ready::readable(),
+                            PollOpt::edge() | PollOpt::oneshot(),
+                        ).unwrap();
+                    }
+                    ERRORS => {
+                        while let Ok((tokens, mut errors)) = recv_errors.try_recv() {
+                            error!("[WORKER {}] {:?}", worker.index(), errors);
+
+                            let serializable = errors.drain(..).map(|(error, time)| {
+                                let mut serializable = serde_json::Map::new();
+                                serializable.insert("df.error/category".to_string(), serde_json::Value::String(error.category.to_string()));
+                                serializable.insert("df.error/message".to_string(), serde_json::Value::String(error.message.to_string()));
+
+                                (serializable, time)
+                            }).collect();
+
+                            let serialized = serde_json::to_string::<(String, Vec<(serde_json::Map<_,_>, u64)>)>(
+                                &("df.error".to_string(), serializable)
+                            ).expect("failed to serialize errors");
+                            let msg = ws::Message::text(serialized);
+
+                            for &token in tokens.iter() {
+                                // @TODO check whether connection still exists
+                                let conn = &mut connections[token.into()];
+
+                                conn.send_message(msg.clone())
+                                    .expect("failed to send message");
+
+                                poll.reregister(
+                                    conn.socket(),
+                                    conn.token(),
+                                    conn.events(),
+                                    PollOpt::edge() | PollOpt::oneshot(),
+                                ).unwrap();
+                            }
+                        }
+
+                        poll.reregister(
+                            &recv_results,
+                            ERRORS,
                             Ready::readable(),
                             PollOpt::edge() | PollOpt::oneshot(),
                         ).unwrap();
@@ -406,20 +479,29 @@ fn main() {
                                         for conn_event in conn_events.drain(0..) {
                                             match conn_event {
                                                 ConnEvent::Message(msg) => {
-                                                    let command = Command {
-                                                        owner: worker.index(),
-                                                        client: Some(token.into()),
-                                                        cmd: msg.into_text().unwrap(),
-                                                    };
+                                                    match serde_json::from_str::<Vec<Request>>(&msg.into_text().unwrap()) {
+                                                        Err(serde_error) => {
+                                                            let error = Error {
+                                                                category: "df.error.category/incorrect",
+                                                                message: serde_error.to_string(),
+                                                            };
 
-                                                    trace!(
-                                                        "[WORKER {}] {:?}",
-                                                        worker.index(),
-                                                        command
-                                                    );
+                                                            send_errors.send((vec![token], vec![(error, next_tx - 1)])).unwrap();
+                                                        }
+                                                        Ok(requests) => {
+                                                            let command = Command {
+                                                                owner: worker.index(),
+                                                                client: token.into(),
+                                                                requests,
+                                                            };
 
-                                                    sequencer.push(command);
+                                                            trace!("[WORKER {}] {:?}", worker.index(), command);
+
+                                                            sequencer.push(command);
+                                                        }
+                                                    }
                                                 }
+                                                // @TODO handle ConnEvent::Close
                                                 _ => {
                                                     println!("other");
                                                 }
@@ -432,17 +514,14 @@ fn main() {
                             let conn_events = connections[token.into()].events();
 
                             if (readiness & conn_events).is_writable() {
-                                match connections[token.into()].write() {
-                                    Err(err) => {
-                                        trace!(
-                                            "[WORKER {}] error while writing: {}",
-                                            worker.index(),
-                                            err
-                                        );
-                                        // @TODO error handling
-                                        connections[token.into()].error(err)
-                                    }
-                                    Ok(_) => {}
+                                if let Err(err) = connections[token.into()].write() {
+                                    trace!(
+                                        "[WORKER {}] error while writing: {}",
+                                        worker.index(),
+                                        err
+                                    );
+                                    // @TODO error handling
+                                    connections[token.into()].error(err)
                                 }
                             }
 
@@ -476,54 +555,51 @@ fn main() {
 
             // handle commands
 
-            while let Some(command) = sequencer.next() {
-                match serde_json::from_str::<Vec<Request>>(&command.cmd) {
-                    Err(msg) => {
-                        panic!("failed to parse command: {:?}", msg);
-                    }
-                    Ok(mut requests) => {
-                        info!("[WORKER {}] {:?}", worker.index(), requests);
+            while let Some(mut command) = sequencer.next() {
 
-                        for req in requests.drain(..) {
-                            let owner = command.owner.clone();
+                // Count-up sequence numbers.
+                next_tx += 1;
 
-                            // @TODO only create a single dataflow, but only if req != Transact
+                info!("[WORKER {}] {:?} {:?}", worker.index(), next_tx, command);
 
-                            match req {
-                                Request::Datom(e, a, v, diff, tx) => server.datom(owner, worker.index(), e, a, v, diff, tx),
-                                Request::Transact(req) => server.transact(req, owner, worker.index()),
-                                Request::Interest(req) => {
-                                    if owner == worker.index() {
-                                        // we are the owning worker and thus have to
-                                        // keep track of this client's new interest
+                let owner = command.owner;
+                let client = command.client;
+                let time = server.context.internal.time().clone();
 
-                                        match command.client {
-                                            None => {}
-                                            Some(client) => {
-                                                let client_token = Token(client);
-                                                server.interests
-                                                    .entry(req.name.clone())
-                                                    .or_insert(Vec::new())
-                                                    .push(client_token);
-                                            }
+                for req in command.requests.drain(..) {
+
+                    // @TODO only create a single dataflow, but only if req != Transact
+
+                    match req {
+                        Request::Transact(req) => {
+                            if let Err(error) = server.transact(req, owner, worker.index()) {
+                                send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                            }
+                        }
+                        Request::Interest(req) => {
+                            // All workers keep track of every client's interests, s.t. they
+                            // know when to clean up unused dataflows.
+
+                            let client_token = Token(command.client);
+                            server.interests
+                                .entry(req.name.clone())
+                                .or_insert_with(HashSet::new)
+                                .insert(client_token);
+
+                            if server.context.global_arrangement(&req.name).is_none() {
+
+                                let send_results_handle = send_results.clone();
+
+                                worker.dataflow::<u64, _, _>(|scope| {
+                                    let name = req.name.clone();
+
+                                    match server.interest(&req.name, scope) {
+                                        Err(error) => {
+                                            send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
                                         }
-                                    }
-
-                                    if !server.context.global_arrangements.contains_key(&req.name) {
-
-                                        let send_results_handle = send_results.clone();
-
-                                        worker.dataflow::<u64, _, _>(|scope| {
-                                            let name = req.name.clone();
-
-                                            server
-                                                .interest(&req.name, scope)
-                                                .import_named(scope, &req.name)
-                                            // @TODO clone entire batches instead of flattening
-                                                .as_collection(|tuple,_| tuple.clone())
+                                        Ok(relation) => {
+                                            relation
                                                 .inner
-                                                // .stream
-                                                // .map(|batch| (*batch).clone())
                                                 .unary_notify(
                                                     Exchange::new(move |_| owner as u64),
                                                     "ResultsRecv",
@@ -544,22 +620,71 @@ fn main() {
                                                         });
                                                     })
                                                 .probe_with(&mut server.probe);
-                                        });
+                                        }
                                     }
+                                });
+                            }
+                        }
+                        Request::Uninterest(name) => {
+                            // All workers keep track of every client's interests, s.t. they
+                            // know when to clean up unused dataflows.
+                            let client_token = Token(command.client);
+                            if let Some(entry) = server.interests.get_mut(&name) {
+                                entry.remove(&client_token);
+
+                                if entry.is_empty() {
+                                    info!("Shutting down {}", name);
+                                    server.interests.remove(&name);
+                                    server.shutdown_handles.remove(&name);
                                 }
-                                Request::Register(req) => server.register(req),
-                                Request::RegisterSource(req) => {
-                                    worker.dataflow::<u64, _, _>(|scope| {
-                                        server.register_source(req, scope);
+                            }
+                        }
+                        Request::Flow(source, sink) => {
+                            // @TODO?
+                            // We treat sinks as single-use right now.
+                            match server.context.internal.sinks.remove(&sink) {
+                                None => {
+                                    let error = Error {
+                                        category: "df.error.category/not-found",
+                                        message: format!("Unknown sink {}", sink),
+                                    };
+                                    send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                                }
+                                Some(mut sink_handle) => {
+                                    let server_handle = &mut server;
+                                    let send_errors_handle = &send_errors;
+
+                                    worker.dataflow::<u64, _, _>(move |scope| {
+                                        match server_handle.interest(&source, scope) {
+                                            Err(error) => {
+                                                send_errors_handle.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                                            }
+                                            Ok(relation) => {
+                                                // @TODO Ideally we only ever want to "send" references
+                                                // to local trace batches. 
+                                                relation
+                                                    .inner
+                                                    .sink(Pipeline, "Flow", move |input| {
+                                                        input.for_each(|_time, data| {
+                                                            for (tuple, time, diff) in data.to_vec().drain(..) {
+                                                                sink_handle.update_at(tuple, time, diff);
+                                                            }
+                                                        });
+
+                                                        let frontier = input.frontier().frontier();
+                                                        if frontier.is_empty() {
+                                                            // @TODO
+                                                            // sink_handle.close();
+                                                            sink_handle.flush();
+                                                        } else {
+                                                            sink_handle.advance_to(frontier[0]);
+                                                            sink_handle.flush();
+                                                        }
+                                                    });
+                                            }
+                                        }
                                     });
                                 }
-                                Request::CreateAttribute(CreateAttribute { name }) => {
-                                    worker.dataflow::<u64, _, _>(|scope| {
-                                        server.create_attribute(&name, scope);
-                                    });
-                                }
-                                Request::AdvanceInput(name, tx) => server.advance_input(name, tx),
-                                Request::CloseInput(name) => server.close_input(name),
                                 #[cfg(feature="graphql")]
                                 Request::GraphQl(name, query) => {
                                     if owner == worker.index() {
@@ -623,6 +748,48 @@ fn main() {
                                 }
                             }
                         }
+                        Request::Register(req) => {
+                            if let Err(error) = server.register(req) {
+                                send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                            }
+                        }
+                        Request::RegisterSource(req) => {
+                            worker.dataflow::<u64, _, _>(|scope| {
+                                if let Err(error) = server.register_source(req, scope) {
+                                    send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                                }
+                            });
+                        }
+                        Request::RegisterSink(req) => {
+                            worker.dataflow::<u64, _, _>(|scope| {
+                                if let Err(error) = server.register_sink(req, scope) {
+                                    send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                                }
+                            });
+                        }
+                        Request::CreateAttribute(CreateAttribute { name, semantics }) => {
+                            worker.dataflow::<u64, _, _>(|scope| {
+                                if let Err(error) = server.context.internal.create_attribute(&name, semantics, scope) {
+                                    send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                                }
+                            });
+                        }
+                        Request::AdvanceDomain(name, next) => {
+                            if let Err(error) = server.advance_domain(name, next) {
+                                send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                            }
+                        }
+                        Request::CloseInput(name) => {
+                            if let Err(error) = server.context.internal.close_input(name) {
+                                send_errors.send((vec![Token(client)], vec![(error, time.clone())])).unwrap();
+                            }
+                        }
+                    }
+                }
+
+                if !config.manual_advance {
+                    if let Err(error) = server.advance_domain(None, next_tx as u64) {
+                        send_errors.send((vec![Token(client)], vec![(error, time)])).unwrap();
                     }
                 }
             }

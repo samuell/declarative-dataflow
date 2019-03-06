@@ -3,7 +3,10 @@
 use timely::dataflow::operators::Concatenate;
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
+use timely::order::{Product, TotalOrder};
+use timely::progress::Timestamp;
 
+use differential_dataflow::lattice::Lattice;
 use differential_dataflow::AsCollection;
 
 #[cfg(feature = "graphql")]
@@ -17,13 +20,12 @@ use crate::graphql_parser::query::{
 #[cfg(feature = "graphql")]
 use crate::plan::Plan;
 
-use crate::plan::{ImplContext, Implementable};
-use crate::{Aid, Value, Var};
-use crate::{CollectionRelation, Relation, VariableMap};
+use crate::plan::{Dependencies, ImplContext, Implementable};
+use crate::{Aid, CollectionRelation, Relation, ShutdownHandle, Value, Var, VariableMap};
 
 /// A plan stage for extracting all matching [e a v] tuples for a
 /// given set of attributes and an input relation specifying entities.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct PullLevel<P: Implementable> {
     /// TODO
     pub variables: Vec<Var>,
@@ -42,7 +44,7 @@ pub struct PullLevel<P: Implementable> {
 ///
 /// (?parent)                      <- [:parent/name] | no constraints
 /// (?parent :parent/child ?child) <- [:child/name]  | [?parent :parent/child ?child]
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Pull<P: Implementable> {
     /// TODO
     pub variables: Vec<Var>,
@@ -57,9 +59,9 @@ pub struct GraphQl {
     pub query: String,
 }
 
-fn interleave(values: &Vec<Value>, constants: &Vec<Aid>) -> Vec<Value> {
+fn interleave(values: &[Value], constants: &[Aid]) -> Vec<Value> {
     if values.is_empty() || constants.is_empty() {
-        values.clone()
+        values.to_owned()
     } else {
         let size: usize = values.len() + constants.len();
         // + 2, because we know there'll be a and v coming...
@@ -70,14 +72,14 @@ fn interleave(values: &Vec<Value>, constants: &Vec<Aid>) -> Vec<Value> {
 
         for i in 0..size {
             if i % 2 == 0 {
-                // on even indices we interleave an attribute
+                // on odd indices we interleave an attribute
                 let a = constants[next_const].clone();
                 result.push(Value::Aid(a));
-                next_const = next_const + 1;
+                next_const += 1;
             } else {
-                // on odd indices we take from the result tuple
+                // on even indices we take from the result tuple
                 result.push(values[next_value].clone());
-                next_value = next_value + 1;
+                next_value += 1;
             }
         }
 
@@ -86,38 +88,44 @@ fn interleave(values: &Vec<Value>, constants: &Vec<Aid>) -> Vec<Value> {
 }
 
 impl<P: Implementable> Implementable for PullLevel<P> {
-    fn dependencies(&self) -> Vec<String> {
-        Vec::new()
+    fn dependencies(&self) -> Dependencies {
+        Dependencies::none()
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
-        use timely::order::Product;
-
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
         use differential_dataflow::operators::arrange::{Arrange, Arranged, TraceAgent};
         use differential_dataflow::operators::JoinCore;
         use differential_dataflow::trace::implementations::ord::OrdValSpine;
+        use differential_dataflow::trace::TraceReader;
 
-        let input = self.plan.implement(nested, local_arrangements, context);
+        let (input, shutdown_input) = self.plan.implement(nested, local_arrangements, context);
 
         if self.pull_attributes.is_empty() {
             if self.path_attributes.is_empty() {
                 // nothing to pull
-                input
+                (input, shutdown_input)
             } else {
                 let path_attributes = self.path_attributes.clone();
                 let tuples = input
                     .tuples()
                     .map(move |tuple| interleave(&tuple, &path_attributes));
 
-                CollectionRelation {
-                    symbols: vec![],
+                let relation = CollectionRelation {
+                    variables: vec![],
                     tuples,
-                }
+                };
+
+                (relation, shutdown_input)
             }
         } else {
             // Arrange input entities by eid.
@@ -130,19 +138,31 @@ impl<P: Implementable> Implementable for PullLevel<P> {
                 TraceAgent<
                     Value,
                     Vec<Value>,
-                    Product<u64, u64>,
+                    Product<T, u64>,
                     isize,
-                    OrdValSpine<Value, Vec<Value>, Product<u64, u64>, isize>,
+                    OrdValSpine<Value, Vec<Value>, Product<T, u64>, isize>,
                 >,
             > = paths.map(|t| (t.last().unwrap().clone(), t)).arrange();
 
+            let mut shutdown_handle = shutdown_input;
             let streams = self.pull_attributes.iter().map(|a| {
                 let e_v = match context.forward_index(a) {
                     None => panic!("attribute {:?} does not exist", a),
-                    Some(index) => index
-                        .propose_trace
-                        .import_named(&nested.parent, a)
-                        .enter(nested),
+                    Some(index) => {
+                        let frontier: Vec<T> = index.propose_trace.advance_frontier().to_vec();
+                        let (arranged, shutdown_propose) =
+                            index.propose_trace.import_core(&nested.parent, a);
+
+                        let e_v = arranged.enter_at(nested, move |_, _, time| {
+                            let mut forwarded = time.clone();
+                            forwarded.advance_by(&frontier);
+                            Product::new(forwarded, 0)
+                        });
+
+                        shutdown_handle.add_button(shutdown_propose);
+
+                        e_v
+                    }
                 };
 
                 let attribute = Value::Aid(a.clone());
@@ -164,38 +184,51 @@ impl<P: Implementable> Implementable for PullLevel<P> {
 
             let tuples = nested.concatenate(streams).as_collection();
 
-            CollectionRelation {
-                symbols: vec![], // @TODO
+            let relation = CollectionRelation {
+                variables: vec![], // @TODO
                 tuples,
-            }
+            };
+
+            (relation, shutdown_handle)
         }
     }
 }
 
 impl<P: Implementable> Implementable for Pull<P> {
-    fn dependencies(&self) -> Vec<String> {
-        Vec::new()
+    fn dependencies(&self) -> Dependencies {
+        Dependencies::none()
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
         let mut scope = nested.clone();
+        let mut shutdown_handle = ShutdownHandle::empty();
+
         let streams = self.paths.iter().map(|path| {
-            path.implement(&mut scope, local_arrangements, context)
-                .tuples()
-                .inner
+            let (relation, shutdown) = path.implement(&mut scope, local_arrangements, context);
+
+            shutdown_handle.merge_with(shutdown);
+
+            relation.tuples().inner
         });
 
         let tuples = nested.concatenate(streams).as_collection();
 
-        CollectionRelation {
-            symbols: vec![], // @TODO
+        let relation = CollectionRelation {
+            variables: vec![], // @TODO
             tuples,
-        }
+        };
+
+        (relation, shutdown_handle)
     }
 }
 

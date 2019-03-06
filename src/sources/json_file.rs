@@ -1,9 +1,6 @@
 //! Operator and utilities to source data from plain files containing
 //! arbitrary json structures.
 
-extern crate serde_json;
-extern crate timely;
-
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -17,18 +14,20 @@ use crate::sources::Sourceable;
 use crate::{Eid, Value};
 
 /// A local filesystem data source containing JSON objects.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct JsonFile {
     /// Path to a file on each workers local filesystem.
     pub path: String,
 }
 
 impl Sourceable for JsonFile {
-    fn source<G: Scope>(
+    type Timestamp = u64;
+
+    fn source<S: Scope<Timestamp = Self::Timestamp>>(
         &self,
-        scope: &G,
+        scope: &S,
         names: Vec<String>,
-    ) -> Stream<G, (usize, ((Value, Value), u64, isize))> {
+    ) -> Stream<S, (usize, ((Value, Value), Self::Timestamp, isize))> {
         let filename = self.path.clone();
 
         generic::operator::source(
@@ -56,9 +55,9 @@ impl Sourceable for JsonFile {
                         let mut session = output.session(cap.as_ref().unwrap());
 
                         for readline in iterator.by_ref().take(256 - 1) {
-                            let line = readline.ok().expect("read error");
+                            let line = readline.expect("read error");
 
-                            if (object_index % num_workers == worker_index) && line.len() > 0 {
+                            if (object_index % num_workers == worker_index) && !line.is_empty() {
                                 // @TODO parse only the names we are interested in
                                 // @TODO run with Value = serde_json::Value
 
@@ -90,7 +89,11 @@ impl Sourceable for JsonFile {
 
                                             session.give((
                                                 name_idx,
-                                                ((Value::Eid(object_index as Eid), v), 0, 1),
+                                                (
+                                                    (Value::Eid(object_index as Eid), v),
+                                                    Default::default(),
+                                                    1,
+                                                ),
                                             ));
                                         }
                                     }

@@ -2,18 +2,21 @@
 
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
+use timely::order::TotalOrder;
+use timely::progress::Timestamp;
 
+use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::JoinCore;
 
 use crate::binding::Binding;
-use crate::plan::{next_id, ImplContext, Implementable};
+use crate::plan::{next_id, Dependencies, ImplContext, Implementable};
 use crate::{Aid, Eid, Value, Var};
-use crate::{CollectionRelation, Relation, VariableMap};
+use crate::{CollectionRelation, Relation, ShutdownHandle, VariableMap};
 
 /// A plan stage joining two source relations on the specified
-/// symbols. Throws if any of the join symbols isn't bound by both
+/// variables. Throws if any of the join variables isn't bound by both
 /// sources.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Join<P1: Implementable, P2: Implementable> {
     /// TODO
     pub variables: Vec<Var>,
@@ -24,16 +27,11 @@ pub struct Join<P1: Implementable, P2: Implementable> {
 }
 
 impl<P1: Implementable, P2: Implementable> Implementable for Join<P1, P2> {
-    fn dependencies(&self) -> Vec<String> {
-        let mut left_dependencies = self.left_plan.dependencies();
-        let mut right_dependencies = self.right_plan.dependencies();
-
-        let mut dependencies =
-            Vec::with_capacity(left_dependencies.len() + right_dependencies.len());
-        dependencies.append(&mut left_dependencies);
-        dependencies.append(&mut right_dependencies);
-
-        dependencies
+    fn dependencies(&self) -> Dependencies {
+        Dependencies::merge(
+            self.left_plan.dependencies(),
+            self.right_plan.dependencies(),
+        )
     }
 
     fn into_bindings(&self) -> Vec<Binding> {
@@ -55,24 +53,12 @@ impl<P1: Implementable, P2: Implementable> Implementable for Join<P1, P2> {
 
         let mut left_eids: Vec<(Eid, Aid, Value)> = left_data
             .iter()
-            .map(|(e, _, _)| {
-                (
-                    eid.clone(),
-                    "df.join/binding".to_string(),
-                    Value::Eid(e.clone()),
-                )
-            })
+            .map(|(e, _, _)| (eid, "df.join/binding".to_string(), Value::Eid(*e)))
             .collect();
 
         let mut right_eids: Vec<(Eid, Aid, Value)> = right_data
             .iter()
-            .map(|(e, _, _)| {
-                (
-                    eid.clone(),
-                    "df.join/binding".to_string(),
-                    Value::Eid(e.clone()),
-                )
-            })
+            .map(|(e, _, _)| (eid, "df.join/binding".to_string(), Value::Eid(*e)))
             .collect();
 
         let mut data = Vec::with_capacity(
@@ -86,40 +72,45 @@ impl<P1: Implementable, P2: Implementable> Implementable for Join<P1, P2> {
         data
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
-        let left = self
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
+        let (left, shutdown_left) = self
             .left_plan
             .implement(nested, local_arrangements, context);
-        let right = self
-            .right_plan
-            .implement(nested, local_arrangements, context);
+        let (right, shutdown_right) =
+            self.right_plan
+                .implement(nested, local_arrangements, context);
 
-        let symbols = self
+        let variables = self
             .variables
             .iter()
             .cloned()
             .chain(
-                left.symbols()
+                left.variables()
                     .iter()
                     .filter(|x| !self.variables.contains(x))
                     .cloned(),
             )
             .chain(
                 right
-                    .symbols()
+                    .variables()
                     .iter()
                     .filter(|x| !self.variables.contains(x))
                     .cloned(),
             )
             .collect();
 
-        let tuples = left.arrange_by_symbols(&self.variables).join_core(
-            &right.arrange_by_symbols(&self.variables),
+        let tuples = left.arrange_by_variables(&self.variables).join_core(
+            &right.arrange_by_variables(&self.variables),
             |key, v1, v2| {
                 Some(
                     key.iter()
@@ -131,6 +122,8 @@ impl<P1: Implementable, P2: Implementable> Implementable for Join<P1, P2> {
             },
         );
 
-        CollectionRelation { symbols, tuples }
+        let shutdown_handle = ShutdownHandle::merge(shutdown_left, shutdown_right);
+
+        (CollectionRelation { variables, tuples }, shutdown_handle)
     }
 }

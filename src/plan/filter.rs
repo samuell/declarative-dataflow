@@ -1,37 +1,45 @@
 //! Predicate expression plan.
 
-use std::collections::HashMap;
-
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
+use timely::order::TotalOrder;
+use timely::progress::Timestamp;
+
+use differential_dataflow::lattice::Lattice;
 
 pub use crate::binding::{BinaryPredicate as Predicate, BinaryPredicateBinding, Binding};
-use crate::plan::{ImplContext, Implementable};
-use crate::{CollectionRelation, Relation, Value, Var, VariableMap};
+use crate::plan::{Dependencies, ImplContext, Implementable};
+use crate::{CollectionRelation, Relation, ShutdownHandle, Value, Var, VariableMap};
 
+#[inline(always)]
 fn lt(a: &Value, b: &Value) -> bool {
     a < b
 }
+#[inline(always)]
 fn lte(a: &Value, b: &Value) -> bool {
     a <= b
 }
+#[inline(always)]
 fn gt(a: &Value, b: &Value) -> bool {
     a > b
 }
+#[inline(always)]
 fn gte(a: &Value, b: &Value) -> bool {
     a >= b
 }
+#[inline(always)]
 fn eq(a: &Value, b: &Value) -> bool {
     a == b
 }
+#[inline(always)]
 fn neq(a: &Value, b: &Value) -> bool {
     a != b
 }
 
 /// A plan stage filtering source tuples by the specified
 /// predicate. Frontends are responsible for ensuring that the source
-/// binds the argument symbols.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// binds the argument variables.
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Filter<P: Implementable> {
     /// TODO
     pub variables: Vec<Var>,
@@ -39,44 +47,50 @@ pub struct Filter<P: Implementable> {
     pub predicate: Predicate,
     /// Plan for the data source.
     pub plan: Box<P>,
-    /// Constant intputs
-    pub constants: HashMap<u32, Value>,
+    /// Constant inputs
+    pub constants: Vec<Option<Value>>,
 }
 
 impl<P: Implementable> Implementable for Filter<P> {
-    fn dependencies(&self) -> Vec<String> {
+    fn dependencies(&self) -> Dependencies {
         self.plan.dependencies()
     }
 
     fn into_bindings(&self) -> Vec<Binding> {
-        let mut bindings = self.plan.into_bindings();
-        let variables = self.variables.clone();
+        // let mut bindings = self.plan.into_bindings();
+        // let variables = self.variables.clone();
 
         unimplemented!();
         // bindings.push(Binding::BinaryPredicate(BinaryPredicateBinding {
-        //     symbols: (variables[0], variables[1]),
+        //     variables: (variables[0], variables[1]),
         //     predicate: self.predicate.clone(),
         // }));
 
         // bindings
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
-        let rel = self.plan.implement(nested, local_arrangements, context);
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
+        let (relation, shutdown_handle) = self.plan.implement(nested, local_arrangements, context);
 
         let key_offsets: Vec<usize> = self
             .variables
             .iter()
-            .map(|sym| {
-                rel.symbols()
+            .map(|variable| {
+                relation
+                    .variables()
                     .iter()
-                    .position(|&v| *sym == v)
-                    .expect("Symbol not found.")
+                    .position(|&v| *variable == v)
+                    .expect("Variable not found.")
             })
             .collect();
 
@@ -89,29 +103,29 @@ impl<P: Implementable> Implementable for Filter<P> {
             Predicate::NEQ => neq,
         };
 
-        if self.constants.contains_key(&0) {
-            let constant = self.constants.get(&0).unwrap().clone();
+        let filtered = if let Some(constant) = self.constants[0].clone() {
             CollectionRelation {
-                symbols: rel.symbols().to_vec(),
-                tuples: rel
+                variables: relation.variables().to_vec(),
+                tuples: relation
                     .tuples()
                     .filter(move |tuple| binary_predicate(&constant, &tuple[key_offsets[0]])),
             }
-        } else if self.constants.contains_key(&1) {
-            let constant = self.constants.get(&1).unwrap().clone();
+        } else if let Some(constant) = self.constants[1].clone() {
             CollectionRelation {
-                symbols: rel.symbols().to_vec(),
-                tuples: rel
+                variables: relation.variables().to_vec(),
+                tuples: relation
                     .tuples()
                     .filter(move |tuple| binary_predicate(&tuple[key_offsets[0]], &constant)),
             }
         } else {
             CollectionRelation {
-                symbols: rel.symbols().to_vec(),
-                tuples: rel.tuples().filter(move |tuple| {
+                variables: relation.variables().to_vec(),
+                tuples: relation.tuples().filter(move |tuple| {
                     binary_predicate(&tuple[key_offsets[0]], &tuple[key_offsets[1]])
                 }),
             }
-        }
+        };
+
+        (filtered, shutdown_handle)
     }
 }

@@ -1,16 +1,18 @@
 //! Function expression plan.
 
-use std::collections::HashMap;
-
 use timely::dataflow::scopes::child::Iterative;
 use timely::dataflow::Scope;
+use timely::order::TotalOrder;
+use timely::progress::Timestamp;
 
-use crate::plan::{ImplContext, Implementable};
-use crate::{CollectionRelation, Relation, VariableMap};
-use crate::{Value, Var};
+use differential_dataflow::lattice::Lattice;
+
+use crate::binding::Binding;
+use crate::plan::{Dependencies, ImplContext, Implementable};
+use crate::{CollectionRelation, Relation, ShutdownHandle, Value, Var, VariableMap};
 
 /// Permitted functions.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub enum Function {
     /// Truncates a unix timestamp into an hourly interval
     TRUNCATE,
@@ -22,63 +24,73 @@ pub enum Function {
 
 /// A plan stage applying a built-in function to source tuples.
 /// Frontends are responsible for ensuring that the source
-/// binds the argument symbols and that the result is projected onto
-/// the right symbol.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// binds the argument variables and that the result is projected onto
+/// the right variable.
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Transform<P: Implementable> {
     /// TODO
     pub variables: Vec<Var>,
-    /// Symbol to which the result of the transformation is bound
-    pub result_sym: Var,
+    /// Variable to which the result of the transformation is bound
+    pub result_variable: Var,
     /// Plan for the data source
     pub plan: Box<P>,
     /// Function to apply
     pub function: Function,
-    /// Constant intputs
-    pub constants: HashMap<u32, Value>,
+    /// Constant inputs
+    pub constants: Vec<Option<Value>>,
 }
 
 impl<P: Implementable> Implementable for Transform<P> {
-    fn dependencies(&self) -> Vec<String> {
+    fn dependencies(&self) -> Dependencies {
         self.plan.dependencies()
     }
 
-    fn implement<'b, S: Scope<Timestamp = u64>, I: ImplContext>(
+    fn into_bindings(&self) -> Vec<Binding> {
+        self.plan.into_bindings()
+    }
+
+    fn implement<'b, T, I, S>(
         &self,
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> CollectionRelation<'b, S> {
-        let rel = self.plan.implement(nested, local_arrangements, context);
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    where
+        T: Timestamp + Lattice + TotalOrder,
+        I: ImplContext<T>,
+        S: Scope<Timestamp = T>,
+    {
+        let (relation, shutdown_handle) = self.plan.implement(nested, local_arrangements, context);
 
         let key_offsets: Vec<usize> = self
             .variables
             .iter()
-            .map(|sym| {
-                rel.symbols()
+            .map(|variable| {
+                relation
+                    .variables()
                     .iter()
-                    .position(|&v| *sym == v)
-                    .expect("Symbol not found.")
+                    .position(|&v| *variable == v)
+                    .expect("Variable not found.")
             })
             .collect();
 
-        let mut symbols = rel.symbols().to_vec().clone();
-        symbols.push(self.result_sym);
+        let mut variables = relation.variables().to_vec();
+        variables.push(self.result_variable);
 
         let constants_local = self.constants.clone();
 
-        match self.function {
+        let transformed = match self.function {
             Function::TRUNCATE => CollectionRelation {
-                symbols: symbols,
-                tuples: rel.tuples().map(move |tuple| {
+                variables,
+                tuples: relation.tuples().map(move |tuple| {
                     let mut t = match tuple[key_offsets[0]] {
                         Value::Instant(inst) => inst as u64,
                         _ => panic!("TRUNCATE can only be applied to timestamps"),
                     };
                     let default_interval = String::from(":hour");
-                    let interval_param = match constants_local.get(&1) {
-                        Some(Value::String(interval)) => interval as &String,
-                        None => &default_interval,
+                    let interval_param = match constants_local[1].clone() {
+                        Some(Value::String(interval)) => interval,
+                        None => default_interval,
                         _ => panic!("Parameter for TRUNCATE must be a string"),
                     };
 
@@ -97,8 +109,8 @@ impl<P: Implementable> Implementable for Transform<P> {
                 }),
             },
             Function::ADD => CollectionRelation {
-                symbols: symbols,
-                tuples: rel.tuples().map(move |tuple| {
+                variables,
+                tuples: relation.tuples().map(move |tuple| {
                     let mut result = 0;
 
                     // summands (vars)
@@ -112,13 +124,15 @@ impl<P: Implementable> Implementable for Transform<P> {
                     }
 
                     // summands (constants)
-                    for val in constants_local.values() {
-                        let summand = match val {
-                            Value::Number(s) => *s as i64,
-                            _ => panic!("ADD can only be applied to numbers"),
-                        };
+                    for arg in &constants_local {
+                        if let Some(constant) = arg {
+                            let summand = match constant {
+                                Value::Number(s) => *s as i64,
+                                _ => panic!("ADD can only be applied to numbers"),
+                            };
 
-                        result += summand;
+                            result += summand;
+                        }
                     }
 
                     let mut v = tuple.clone();
@@ -127,14 +141,14 @@ impl<P: Implementable> Implementable for Transform<P> {
                 }),
             },
             Function::SUBTRACT => CollectionRelation {
-                symbols: symbols,
-                tuples: rel.tuples().map(move |tuple| {
-                    // minuend is either symbol or variable, depending on
+                variables,
+                tuples: relation.tuples().map(move |tuple| {
+                    // minuend is either variable or variable, depending on
                     // position in transform
 
-                    let mut result = match constants_local.get(&0) {
+                    let mut result = match constants_local[0].clone() {
                         Some(constant) => match constant {
-                            Value::Number(minuend) => *minuend as i64,
+                            Value::Number(minuend) => minuend as i64,
                             _ => panic!("SUBTRACT can only be applied to numbers"),
                         },
                         None => match tuple[key_offsets[0]] {
@@ -157,13 +171,15 @@ impl<P: Implementable> Implementable for Transform<P> {
                     }
 
                     // subtrahends (constants)
-                    for val in constants_local.values() {
-                        let subtrahend = match val {
-                            Value::Number(s) => *s as i64,
-                            _ => panic!("SUBTRACT can only be applied to numbers"),
-                        };
+                    for arg in &constants_local {
+                        if let Some(constant) = arg {
+                            let subtrahend = match constant {
+                                Value::Number(s) => *s as i64,
+                                _ => panic!("SUBTRACT can only be applied to numbers"),
+                            };
 
-                        result -= subtrahend;
+                            result -= subtrahend;
+                        }
                     }
 
                     let mut v = tuple.clone();
@@ -171,6 +187,8 @@ impl<P: Implementable> Implementable for Transform<P> {
                     v
                 }),
             },
-        }
+        };
+
+        (transformed, shutdown_handle)
     }
 }

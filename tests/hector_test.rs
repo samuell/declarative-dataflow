@@ -1,6 +1,3 @@
-extern crate declarative_dataflow;
-extern crate timely;
-
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::mpsc::channel;
@@ -10,15 +7,13 @@ use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::Operator;
 use timely::Configuration;
 
-use declarative_dataflow::binding::BinaryPredicate::{GT, LT};
-use declarative_dataflow::binding::{
-    AttributeBinding, BinaryPredicateBinding, Binding, ConstantBinding,
-};
+use declarative_dataflow::binding::BinaryPredicate::LT;
+use declarative_dataflow::binding::{AsBinding, Binding};
+use declarative_dataflow::plan::hector::{plan_order, source_conflicts};
 use declarative_dataflow::plan::Hector;
-use declarative_dataflow::server::{Server, Transact, TxData};
-use declarative_dataflow::{Aid, Plan, Rule, Value};
-use Binding::{Attribute, BinaryPredicate, Constant};
-use Value::{Eid, Number, String};
+use declarative_dataflow::server::Server;
+use declarative_dataflow::{Aid, AttributeSemantics, Plan, Rule, TxData, Value};
+use Value::{Bool, Eid, Number, String};
 
 struct Case {
     description: &'static str,
@@ -31,28 +26,164 @@ fn dependencies(case: &Case) -> HashSet<Aid> {
     let mut deps = HashSet::new();
 
     for binding in case.plan.bindings.iter() {
-        match binding {
-            Attribute(binding) => {
-                deps.insert(binding.source_attribute.clone());
-            }
-            _ => {}
+        if let Binding::Attribute(binding) = binding {
+            deps.insert(binding.source_attribute.clone());
         }
     }
 
     deps
 }
 
+/// Ensures bindings report correct dependencies before being asked to
+/// extend a prefix.
+#[test]
+fn binding_requirements() {
+    let (a, b, c, d) = (0, 1, 2, 3);
+
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).required_to_extend(&vec![a, c], d),
+        None
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).required_to_extend(&vec![a, c], b),
+        Some(None)
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).required_to_extend(&vec![c, d], a),
+        Some(Some(b))
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).required_to_extend(&vec![c, d], b),
+        Some(Some(a))
+    );
+}
+
+/// Ensures bindings honor the correct dependencies before offering to
+/// extend a prefix to a new variable.
+#[test]
+fn binding_readiness() {
+    let (a, b, c, d) = (0, 1, 2, 3);
+
+    assert_eq!(
+        Binding::constant(a, Eid(100)).ready_to_extend(&vec![a, b]),
+        None
+    );
+    assert_eq!(
+        Binding::constant(a, Eid(100)).ready_to_extend(&vec![c, d]),
+        Some(a)
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).ready_to_extend(&vec![c, d]),
+        None
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).ready_to_extend(&vec![a, c]),
+        Some(b)
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).ready_to_extend(&vec![c, a]),
+        Some(b)
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).ready_to_extend(&vec![c, b]),
+        Some(a)
+    );
+    assert_eq!(
+        Binding::attribute(a, ":edge", b).ready_to_extend(&vec![b, c]),
+        Some(a)
+    );
+}
+
+/// Ensures that conflicts involving the source binding are identified
+/// correctly.
+#[test]
+fn conflicts() {
+    let (e, c, e2, a, n) = (0, 1, 2, 3, 4);
+    let bindings = vec![
+        Binding::attribute(e2, ":age", a),
+        Binding::attribute(e, ":age", a),
+        Binding::attribute(e, ":name", c),
+        Binding::attribute(e2, ":name", n),
+        Binding::constant(c, String("Ivan".to_string())),
+        Binding::not(Binding::constant(c, String("Petr".to_string()))),
+    ];
+
+    assert_eq!(source_conflicts(0, &bindings), Vec::<&Binding>::new());
+    assert_eq!(
+        source_conflicts(2, &bindings),
+        vec![
+            &Binding::constant(c, String("Ivan".to_string())),
+            &Binding::not(Binding::constant(c, String("Petr".to_string()))),
+        ]
+    );
+}
+
+/// Ensures that a valid variable order is chosen depending on the
+/// current source binding.
+#[test]
+fn ordering() {
+    let (e, c, e2, a, n) = (0, 1, 2, 3, 4);
+    let bindings = vec![
+        Binding::attribute(e2, ":age", a),
+        Binding::attribute(e, ":age", a),
+        Binding::attribute(e, ":name", c),
+        Binding::attribute(e2, ":name", n),
+        Binding::constant(c, String("Ivan".to_string())),
+    ];
+
+    {
+        let (variable_order, binding_order) = plan_order(0, &bindings);
+
+        assert_eq!(variable_order, vec![e2, a, e, n, c]);
+        assert_eq!(
+            binding_order,
+            vec![
+                Binding::attribute(e, ":age", a),
+                Binding::attribute(e2, ":name", n),
+                Binding::attribute(e, ":name", c),
+                Binding::constant(c, String("Ivan".to_string())),
+            ]
+        );
+    }
+    {
+        let (variable_order, binding_order) = plan_order(1, &bindings);
+
+        assert_eq!(variable_order, vec![e, a, c, e2, n]);
+        assert_eq!(
+            binding_order,
+            vec![
+                Binding::attribute(e, ":name", c),
+                Binding::attribute(e2, ":age", a),
+                Binding::attribute(e2, ":name", n),
+                Binding::constant(c, String("Ivan".to_string())),
+            ]
+        );
+    }
+    {
+        let (variable_order, binding_order) = plan_order(2, &bindings);
+
+        assert_eq!(variable_order, vec![e, c, a, e2, n]);
+        assert_eq!(
+            binding_order,
+            vec![
+                Binding::attribute(e, ":age", a),
+                Binding::attribute(e2, ":age", a),
+                Binding::attribute(e2, ":name", n),
+                Binding::constant(c, String("Ivan".to_string())),
+            ]
+        );
+    }
+}
+
 #[test]
 fn run_hector_cases() {
-    let mut cases: Vec<Case> = vec![
+    let mut cases: Vec<Case> =
+        vec![
         Case {
             description: "[?e :name ?n]",
             plan: Hector {
                 variables: vec![0, 1],
-                bindings: vec![Attribute(AttributeBinding {
-                    symbols: (0, 1),
-                    source_attribute: ":name".to_string(),
-                })],
+                bindings: vec![Binding::attribute(0, ":name", 1)],
             },
             transactions: vec![vec![
                 TxData(1, 1, ":name".to_string(), String("Dipper".to_string())),
@@ -70,14 +201,8 @@ fn run_hector_cases() {
             plan: Hector {
                 variables: vec![0, 1],
                 bindings: vec![
-                    Attribute(AttributeBinding {
-                        symbols: (0, 1),
-                        source_attribute: ":name".to_string(),
-                    }),
-                    Constant(ConstantBinding {
-                        symbol: 1,
-                        value: String("Dipper".to_string()),
-                    }),
+                    Binding::attribute(0, ":name", 1),
+                    Binding::constant(1, String("Dipper".to_string())),
                 ],
             },
             transactions: vec![vec![
@@ -94,14 +219,8 @@ fn run_hector_cases() {
                 plan: Hector {
                     variables: vec![e, a, n],
                     bindings: vec![
-                        Attribute(AttributeBinding {
-                            symbols: (e, n),
-                            source_attribute: ":name".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (e, a),
-                            source_attribute: ":age".to_string(),
-                        }),
+                        Binding::attribute(e, ":name", n),
+                        Binding::attribute(e, ":age", a),
                     ],
                 },
                 transactions: vec![vec![
@@ -124,18 +243,9 @@ fn run_hector_cases() {
                 plan: Hector {
                     variables: vec![a, b, c],
                     bindings: vec![
-                        Attribute(AttributeBinding {
-                            symbols: (a, b),
-                            source_attribute: "edge".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (b, c),
-                            source_attribute: "edge".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (a, c),
-                            source_attribute: "edge".to_string(),
-                        }),
+                        Binding::attribute(a, "edge", b),
+                        Binding::attribute(b, "edge", c),
+                        Binding::attribute(a, "edge", c),
                     ],
                 },
                 transactions: vec![vec![
@@ -156,22 +266,10 @@ fn run_hector_cases() {
                 plan: Hector {
                     variables: vec![e, a, b, c, d],
                     bindings: vec![
-                        Attribute(AttributeBinding {
-                            symbols: (e, a),
-                            source_attribute: ":age".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (e, b),
-                            source_attribute: ":name".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (e, c),
-                            source_attribute: ":likes".to_string(),
-                        }),
-                        Attribute(AttributeBinding {
-                            symbols: (e, d),
-                            source_attribute: ":fears".to_string(),
-                        }),
+                        Binding::attribute(e, ":age", a),
+                        Binding::attribute(e, ":name", b),
+                        Binding::attribute(e, ":likes", c),
+                        Binding::attribute(e, ":fears", d),
                     ],
                 },
                 transactions: vec![vec![
@@ -201,18 +299,9 @@ fn run_hector_cases() {
             plan: Hector {
                 variables: vec![0, 1, 2],
                 bindings: vec![
-                    Attribute(AttributeBinding {
-                        symbols: (0, 1),
-                        source_attribute: ":num".to_string(),
-                    }),
-                    Attribute(AttributeBinding {
-                        symbols: (0, 2),
-                        source_attribute: ":num".to_string(),
-                    }),
-                    BinaryPredicate(BinaryPredicateBinding {
-                        symbols: (1, 2),
-                        predicate: LT,
-                    }),
+                    Binding::attribute(0, ":num", 1),
+                    Binding::attribute(0, ":num", 2),
+                    Binding::binary_predicate(LT, 1, 2),
                 ],
             },
             transactions: vec![vec![
@@ -232,26 +321,11 @@ fn run_hector_cases() {
             plan: Hector {
                 variables: vec![0, 1, 3, 2],
                 bindings: vec![
-                    Attribute(AttributeBinding {
-                        symbols: (0, 1),
-                        source_attribute: ":num".to_string(),
-                    }),
-                    Attribute(AttributeBinding {
-                        symbols: (0, 2),
-                        source_attribute: ":num".to_string(),
-                    }),
-                    Constant(ConstantBinding {
-                        symbol: 3,
-                        value: Number(18),
-                    }),
-                    Constant(ConstantBinding {
-                        symbol: 1,
-                        value: Number(10),
-                    }),
-                    BinaryPredicate(BinaryPredicateBinding {
-                        symbols: (2, 3),
-                        predicate: LT,
-                    }),
+                    Binding::attribute(0, ":num", 1),
+                    Binding::attribute(0, ":num", 2),
+                    Binding::constant(3, Number(18)),
+                    Binding::constant(1, Number(10)),
+                    Binding::binary_predicate(LT, 2, 3),
                 ],
             },
             transactions: vec![vec![
@@ -265,11 +339,69 @@ fn run_hector_cases() {
                 1,
             )]],
         },
+        {
+            let (e, n, a, admin) = (1, 2, 3, 4);
+            Case {
+                description:
+                    "[?e :name ?n] [?e :age ?a] [?e :admin? ?admin] (constant ?admin true)",
+                plan: Hector {
+                    variables: vec![e, n, a, admin],
+                    bindings: vec![
+                        Binding::attribute(e, ":name", n),
+                        Binding::attribute(e, ":age", a),
+                        Binding::attribute(e, ":admin?", admin),
+                        Binding::constant(admin, Bool(true)),
+                    ],
+                },
+                transactions: vec![vec![
+                    TxData(1, 100, ":name".to_string(), String("Dipper".to_string())),
+                    TxData(1, 100, ":age".to_string(), Number(12)),
+                    TxData(1, 100, ":admin?".to_string(), Bool(true)),
+                    TxData(1, 200, ":name".to_string(), String("Mabel".to_string())),
+                    TxData(1, 100, ":age".to_string(), Number(12)),
+                    TxData(1, 100, ":admin?".to_string(), Bool(false)),
+                ]],
+                expectations: vec![vec![
+                    (
+                        vec![
+                            Eid(100),
+                            String("Dipper".to_string()),
+                            Number(12),
+                            Bool(true),
+                        ],
+                        0,
+                        1,
+                    ),
+                ]],
+            }
+        },
+        {
+            let (e, n, admin) = (1, 2, 3);
+            Case {
+                description: "[?e :name ?n] [?e :admin? ?admin :else false]",
+                plan: Hector {
+                    variables: vec![e, n, admin],
+                    bindings: vec![
+                        Binding::attribute(e, ":name", n),
+                        Binding::optional_attribute(e, ":admin?", admin, Bool(false)),
+                    ],
+                },
+                transactions: vec![vec![
+                    TxData(1, 100, ":name".to_string(), String("Dipper".to_string())),
+                    TxData(1, 100, ":admin?".to_string(), Bool(true)),
+                    TxData(1, 200, ":name".to_string(), String("Mabel".to_string())),
+                ]],
+                expectations: vec![vec![
+                    (vec![Eid(100), String("Dipper".to_string()), Bool(true)], 0, 1),
+                    (vec![Eid(200), String("Mabel".to_string()), Bool(false)], 0, 1),
+                ]],
+            }
+        },
     ];
 
     for case in cases.drain(..) {
         timely::execute(Configuration::Thread, move |worker| {
-            let mut server = Server::<u64>::new(Default::default());
+            let mut server = Server::<u64, u64>::new(Default::default());
             let (send_results, results) = channel();
 
             dbg!(case.description);
@@ -279,7 +411,11 @@ fn run_hector_cases() {
 
             worker.dataflow::<u64, _, _>(|scope| {
                 for dep in deps.iter() {
-                    server.create_attribute(dep, scope);
+                    server
+                        .context
+                        .internal
+                        .create_attribute(dep, AttributeSemantics::Raw, scope)
+                        .unwrap();
                 }
 
                 server
@@ -301,10 +437,13 @@ fn run_hector_cases() {
             });
 
             let mut transactions = case.transactions.clone();
+            let mut next_tx = 0;
 
             for (tx_id, tx_data) in transactions.drain(..).enumerate() {
-                let tx = Some(tx_id as u64);
-                server.transact(Transact { tx, tx_data }, 0, 0);
+                next_tx += 1;
+
+                server.transact(tx_data, 0, 0).unwrap();
+                server.advance_domain(None, next_tx).unwrap();
 
                 worker.step_while(|| server.is_any_outdated());
 
@@ -314,7 +453,7 @@ fn run_hector_cases() {
                 for _i in 0..expected.len() {
                     match results.recv_timeout(Duration::from_millis(400)) {
                         Err(_err) => {
-                            eprint!("No result.");
+                            eprint!("Missing results: {:?}", expected);
                             dbg!(&case.plan.bindings);
                         }
                         Ok(result) => {
