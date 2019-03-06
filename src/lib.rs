@@ -82,21 +82,6 @@ pub enum Value {
     Uuid([u8; 16]),
 }
 
-impl ToString for Value {
-    fn to_string(&self) -> String {
-        match self {
-            Value::Aid(x) => x.to_string(),
-            Value::String(x) => x.to_string(),
-            Value::Bool(x) => x.to_string(),
-            Value::Number(x) => x.to_string(),
-            Value::Rational32(x) => x.to_string(),
-            Value::Eid(x) => x.to_string(),
-            Value::Instant(x) => x.to_string(),
-            Value::Uuid(x) => format!("{:?}", x),
-        }
-    }
-}
-
 /// A (tuple, time, diff) triple, as sent back to clients.
 pub type Result = (Vec<Value>, u64, isize);
 

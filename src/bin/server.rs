@@ -73,59 +73,69 @@ pub fn paths_to_nested(paths: Vec<Vec<declarative_dataflow::Value>>) -> Value {
     for mut path in paths {
         let mut current_map = &mut acc;
         let last_val = path.pop().unwrap();
-        let last_key = path.pop().unwrap().to_string();
 
-        for attribute in path {
-            let entry = current_map
-                .entry(attribute.to_string())
-                .or_insert_with(|| Value::Object(map::Map::new()));
+        if let declarative_dataflow::Value::Aid(last_key) = path.pop().unwrap() {
+            for attribute in path {
+                let attr: String;
+                match attribute {
+                    declarative_dataflow::Value::Aid(x) => attr = x,
+                    declarative_dataflow::Value::Eid(x) => attr = x.to_string(),
+                    _ => unreachable!(),
+                };
 
-            *entry = match entry {
-                Value::Object(m) => Value::Object(std::mem::replace(m, map::Map::new())),
-                Value::Array(_) => unreachable!(),
-                _ => Value::Object(map::Map::new()),
-            };
+                let entry = current_map
+                    .entry(attr)
+                    .or_insert_with(|| Value::Object(map::Map::new()));
 
-            match entry {
-                Value::Object(m) => current_map = m,
-                _ => unreachable!(),
-            };
-        }
+                *entry = match entry {
+                    Value::Object(m) => Value::Object(std::mem::replace(m, map::Map::new())),
+                    Value::Array(_) => unreachable!(),
+                    _ => Value::Object(map::Map::new()),
+                };
 
-        match current_map.get(&last_key) {
-            Some(Value::Object(_)) => (),
-            _ => {
-                current_map.insert(last_key, json!(last_val));
+                match entry {
+                    Value::Object(m) => current_map = m,
+                    _ => unreachable!(),
+                };
             }
-        };
+
+            match current_map.get(&last_key) {
+                Some(Value::Object(_)) => (),
+                _ => {
+                    current_map.insert(last_key, json!(last_val));
+                }
+            };
+        } else {
+            unreachable!();
+        }
     }
 
     Value::Object(acc)
 }
 
-/// Takes a GraphQL-like nested value and squashed eid-Objects into vectors
-#[cfg(feature = "graphql")]
-pub fn squash_nested(nested: Value) -> Value {
-    if let Value::Object(m) = nested {
-        let new = m.into_iter().fold(map::Map::new(), |mut acc, (k, v)| {
-            let to_add = if let Value::Object(nested_v) = v {
-                let nested_squashed_v: Vec<Value> = nested_v
-                    .into_iter()
-                    .map(|(_nested_k, nested_v)| squash_nested(nested_v))
-                    .collect();
-                Value::Array(nested_squashed_v)
-            } else {
-                v
-            };
+/// Takes a GraphQL-like nested value and squashes eid-Objects into vectors
+// #[cfg(feature = "graphql")]
+// pub fn squash_nested(nested: Value) -> Value {
+//     if let Value::Object(m) = nested {
+//         let new = m.into_iter().fold(map::Map::new(), |mut acc, (k, v)| {
+//             let to_add = if let Value::Object(nested_v) = v {
+//                 let nested_squashed_v: Vec<Value> = nested_v
+//                     .into_iter()
+//                     .map(|(_nested_k, nested_v)| squash_nested(nested_v))
+//                     .collect();
+//                 Value::Array(nested_squashed_v)
+//             } else {
+//                 v
+//             };
 
-            acc.insert(k, to_add);
-            acc
-        });
-        Value::Object(new)
-    } else {
-        nested
-    }
-}
+//             acc.insert(k, to_add);
+//             acc
+//         });
+//         Value::Object(new)
+//     } else {
+//         nested
+//     }
+// }
 
 fn main() {
     env_logger::init();
@@ -581,13 +591,11 @@ fn main() {
                                                 .as_collection(|tuple,_| tuple.clone())
                                                 .inner
                                                 .map(|x| ((), x))
-                                                // @TODO: filter out short paths while constructing paths
-                                                // @TODO: make sure that everything is collected again on new data
                                                 .aggregate::<_,Vec<_>,_,_,_>(
                                                     |_key, (path, _time, _diff), acc| { acc.push(path); },
                                                     |_key, paths| {
-                                                        let nested = paths_to_nested(paths);
-                                                        squash_nested(nested)
+                                                       paths_to_nested(paths)
+                                                        // squash_nested(nested)
                                                     },
                                                     |_key| 1)
                                                 .unary_notify(
