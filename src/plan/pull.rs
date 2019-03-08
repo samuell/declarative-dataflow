@@ -114,17 +114,8 @@ impl<P: Implementable> Implementable for PullLevel<P> {
             let paths = input.tuples();
             let e_path: Arranged<
                 Iterative<S, u64>,
-                Value,
-                Vec<Value>,
-                isize,
-                TraceAgent<
-                    Value,
-                    Vec<Value>,
-                    Product<T, u64>,
-                    isize,
-                    OrdValSpine<Value, Vec<Value>, Product<T, u64>, isize>,
-                >,
-            > = paths.map(|t| (t.last().unwrap().clone(), t)).arrange();
+                TraceAgent<OrdValSpine<Value, Vec<Value>, Product<T, u64>, isize>>>
+                = paths.map(|t| (t.last().unwrap().clone(), t)).arrange();
 
             let mut shutdown_handle = shutdown_input;
             let streams = self.pull_attributes.iter().map(|a| {
