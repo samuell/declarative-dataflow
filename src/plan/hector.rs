@@ -1,7 +1,7 @@
 //! WCO expression plan, integrating the following work:
 //! https://github.com/frankmcsherry/differential-dataflow/tree/master/dogsdogsdogs
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::rc::Rc;
 
@@ -25,8 +25,8 @@ use crate::binding::{AsBinding, BinaryPredicate, Binding};
 use crate::binding::{BinaryPredicateBinding, ConstantBinding};
 use crate::plan::{Dependencies, ImplContext, Implementable};
 use crate::timestamp::altneu::AltNeu;
+use crate::{Aid, Value, Var};
 use crate::{CollectionRelation, LiveIndex, ShutdownHandle, VariableMap};
-use crate::{Value, Var};
 
 type Extender<'a, S, P, V> = Box<(dyn PrefixExtender<S, Prefix = P, Extension = V> + 'a)>;
 
@@ -319,7 +319,22 @@ impl IndexNode<Value> for Vec<Value> {
 
 impl Implementable for Hector {
     fn dependencies(&self) -> Dependencies {
-        Dependencies::none()
+        let attributes = self
+            .bindings
+            .iter()
+            .flat_map(|binding| {
+                if let Binding::Attribute(binding) = binding {
+                    Some(binding.source_attribute.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<Aid>>();
+
+        Dependencies {
+            names: HashSet::new(),
+            attributes,
+        }
     }
 
     fn into_bindings(&self) -> Vec<Binding> {
@@ -331,7 +346,7 @@ impl Implementable for Hector {
         nested: &mut Iterative<'b, S, u64>,
         _local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle)
     where
         T: Timestamp + Lattice + TotalOrder,
         I: ImplContext<T>,
@@ -436,7 +451,8 @@ impl Implementable for Hector {
                                 .entry(delta_binding.source_attribute.to_string())
                                 .or_insert_with(|| {
                                     let (arranged, shutdown) =
-                                        context.forward_index(&delta_binding.source_attribute).unwrap()
+                                        context.forward_index(&delta_binding.source_attribute)
+                                        .expect("forward_index doesn't exist")
                                         .import(&scope.parent.parent);
 
                                     shutdown_handle.merge_with(shutdown);
@@ -586,7 +602,8 @@ impl Implementable for Hector {
                                                                 let index = forward_cache.entry(other.source_attribute.to_string())
                                                                     .or_insert_with(|| {
                                                                         let (arranged, shutdown) =
-                                                                            context.forward_index(&other.source_attribute).unwrap()
+                                                                            context.forward_index(&other.source_attribute)
+                                                                            .expect("forward index doesn't exist")
                                                                             .import(&scope.parent.parent);
 
                                                                         shutdown_handle.merge_with(shutdown);

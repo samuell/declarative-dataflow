@@ -2,10 +2,9 @@ use std::collections::HashSet;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use timely::Configuration;
-
 #[cfg(feature = "graphql")]
 use declarative_dataflow::plan::GraphQl;
+
 use declarative_dataflow::plan::{Pull, PullLevel};
 use declarative_dataflow::server::Server;
 use declarative_dataflow::{AttributeSemantics, Plan, Rule, TxData, Value};
@@ -14,7 +13,7 @@ use Value::{Aid, Bool, Eid, Number, String};
 
 #[test]
 fn pull_level() {
-    timely::execute(Configuration::Thread, |worker| {
+    timely::execute_directly(|worker| {
         let mut server = Server::<u64, u64>::new(Default::default());
         let (send_results, results) = channel();
 
@@ -104,13 +103,12 @@ fn pull_level() {
         }
 
         assert!(results.recv_timeout(Duration::from_millis(400)).is_err());
-    })
-    .unwrap();
+    });
 }
 
 #[test]
 fn pull_children() {
-    timely::execute(Configuration::Thread, |worker| {
+    timely::execute_directly(|worker| {
         let mut server = Server::<u64, u64>::new(Default::default());
         let (send_results, results) = channel();
 
@@ -223,13 +221,12 @@ fn pull_children() {
         }
 
         assert!(results.recv_timeout(Duration::from_millis(400)).is_err());
-    })
-    .unwrap();
+    });
 }
 
 #[test]
 fn pull() {
-    timely::execute(Configuration::Thread, |worker| {
+    timely::execute_directly(|worker| {
         let mut server = Server::<u64, u64>::new(Default::default());
         let (send_results, results) = channel();
 
@@ -363,8 +360,7 @@ fn pull() {
         }
 
         assert!(results.recv_timeout(Duration::from_millis(400)).is_err());
-    })
-    .unwrap();
+    });
 }
 
 #[cfg(feature = "graphql")]
