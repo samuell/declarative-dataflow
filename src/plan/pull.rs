@@ -53,6 +53,7 @@ pub struct Pull<P: Implementable> {
 }
 
 /// A plan for GraphQL queries, e.g. `{ Heroes { name age weight } }`
+#[cfg(feature = "graphql")]
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct GraphQl {
     /// String representation of GraphQL query
