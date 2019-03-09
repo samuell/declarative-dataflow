@@ -57,6 +57,8 @@ pub struct Pull<P: Implementable> {
 pub struct GraphQl {
     /// String representation of GraphQL query
     pub query: String,
+    /// Cached paths
+    pub paths: Vec<PullLevel<Plan>>,
 }
 
 fn interleave(values: &[Value], constants: &[Aid]) -> Vec<Value> {
@@ -336,16 +338,27 @@ fn ast_to_paths(ast: Document) -> Vec<PullLevel<Plan>> {
 }
 
 #[cfg(feature = "graphql")]
+impl GraphQl {
+    /// Creates a new GraphQL instance by parsing the ast obtained from the provided query
+    pub fn new(query: String) -> Self {
+        let q = query.clone();
+        GraphQl {
+            query,
+            paths: ast_to_paths(parse_query(&q).expect("graphQL ast parsing failed")),
+        }
+    }
+}
+
+#[cfg(feature = "graphql")]
 impl Implementable for GraphQl {
     fn dependencies(&self) -> Dependencies {
-        // @TODO cache this?
-        let ast = parse_query(&self.query).expect("graphQL ast parsing failed");
-        let parsed = Pull {
-            variables: vec![],
-            paths: ast_to_paths(ast),
-        };
+        let mut dependencies = Dependencies::none();
 
-        parsed.dependencies()
+        for path in self.paths.iter() {
+            dependencies = Dependencies::merge(dependencies, path.dependencies());
+        }
+
+        dependencies
     }
 
     fn implement<'b, T, I, S>(
@@ -353,7 +366,7 @@ impl Implementable for GraphQl {
         nested: &mut Iterative<'b, S, u64>,
         local_arrangements: &VariableMap<Iterative<'b, S, u64>>,
         context: &mut I,
-    ) -> (CollectionRelation<'b, S>, ShutdownHandle<T>)
+    ) -> (CollectionRelation<'b, S>, ShutdownHandle)
     where
         T: Timestamp + Lattice + TotalOrder,
         I: ImplContext<T>,

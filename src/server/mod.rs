@@ -453,7 +453,7 @@ where
         let req = Register {
             rules: vec![Rule {
                 name: name.to_string(),
-                plan: Plan::GraphQl(GraphQl { query }),
+                plan: Plan::GraphQl(GraphQl::new(query)),
             }],
             publish: vec![name.to_string()],
         };
