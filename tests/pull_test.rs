@@ -366,13 +366,11 @@ fn pull() {
 #[cfg(feature = "graphql")]
 #[test]
 fn graph_ql() {
-    timely::execute(Configuration::Thread, |worker| {
+    timely::execute_directly(|worker| {
         let mut server = Server::<u64, u64>::new(Default::default());
         let (send_results, results) = channel();
 
-        let plan = Plan::GraphQl(GraphQl {
-            query: "{hero {name height mass}}".to_string(),
-        });
+        let plan = Plan::GraphQl(GraphQl::new("{hero {name height mass}}".to_string()));
 
         worker.dataflow::<u64, _, _>(|scope| {
             server
@@ -481,6 +479,5 @@ fn graph_ql() {
         }
 
         assert!(results.recv_timeout(Duration::from_millis(400)).is_err());
-    })
-    .unwrap();
+    });
 }
